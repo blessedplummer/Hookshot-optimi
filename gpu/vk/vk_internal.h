@@ -105,6 +105,8 @@ struct BufferRef {
     }
 };
 bool memory_init();                                   // vk_memory.cpp
+/// (dGPU policy) RX_VK_DGPU's gate, read once: false unless the switch is set (vk_memory.cpp)
+bool dgpu_on();
 void memory_cpu_owned(uint64_t guest, uint64_t size);   // (hookshot: words the replay writes on the CPU, left out of write-backs)
 // (hookshot) The replay's own CPU writes of guest memory, by GPU address: every one goes through guest_cpu_write (or, for a
 // write made in pieces, host->gpu_write and then guest_cpu_wrote over the whole range), so that the write-back diff's shadows
@@ -226,6 +228,8 @@ void memory_rb_segments_begin(uint64_t base, uint64_t n);   // (and a parallel r
 void memory_note_gpu_write(uint64_t gpu, uint64_t size);
 /// (vk_replay.cpp) The GPU's progress on the recordings' timeline, and a wait for it to reach v
 uint64_t vk_timeline_completed();
+/// (dGPU policy) The GPU time recorded so far, in nanoseconds: the mirror trial's A/B reads it (vk_replay.cpp)
+int64_t gpu_time_total_ns();
 /// A future submission completion covering images retired during replay; zero: no safe value.
 uint64_t vk_retirement_value();
 void vk_timeline_wait(uint64_t v);

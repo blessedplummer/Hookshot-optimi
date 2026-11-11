@@ -279,7 +279,10 @@ int64_t st_wait_ns;   // (time the replay waited for a recording slot: the GPU b
 // round again (the work done by then)
 VkQueryPool ts_pool = VK_NULL_HANDLE;
 bool ts_pending[kRecordings];
-int64_t st_gpu_ns, st_gpu_max_ns;
+int64_t st_gpu_max_ns;
+std::atomic<int64_t> st_gpu_ns;   // (dGPU policy: the mirror trial reads it from the recording thread too)
+/// (dGPU policy) The GPU time recorded so far (vk_internal.h): the trial's per-window deltas
+int64_t gpu_time_total_ns() { return st_gpu_ns.load(std::memory_order_relaxed); }
 void gpu_time_collect(Recording& r) {
     if (!ts_pool || !ts_pending[r.slot]) return;
     ts_pending[r.slot] = false;
@@ -2281,6 +2284,12 @@ void invalidate(uint64_t gpu, uint64_t size) {
     if (size) {
         static const bool off = getenv("RX_VK_NO_READBACK_WAIT") != nullptr;
         bool ever = false;
+        // (dGPU policy, RX_VK_DGPU) The note first, before the "ever had a write-back" gate: the sparse write-back
+        // copies only the pages the CPU is seen reading, so a page no write-back ever covered would never be learned
+        // and would stay un-copied for the whole run (the exposure meter would read zeros forever). Learning the page
+        // here is what lets the submission's write-back include it from now on; the wait below is unchanged and still
+        // runs only when a write-back ever covered the range.
+        if (!off && dgpu_on()) memory_note_readback(host->gpu_guest(gpu), size);
         if (!off && (memory_writeback_value(host->gpu_guest(gpu), size, &ever), ever)) {
             memory_note_readback(host->gpu_guest(gpu), size);   // (PR 430: the CPU may write it back: memory_rb_refresh)
             static std::atomic<int64_t> calls{0}, waited{0}, ns{0};
