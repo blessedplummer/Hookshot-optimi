@@ -2792,8 +2792,18 @@ BufferRef gpu_buffer_bind(uint64_t gpu, uint64_t size, bool written) {
         Pool* p = tl.p;
         const uint64_t off = guest - p->lo;
         if (p->last_value < mem_rec_value) p->last_value = mem_rec_value;
-        if (!mirror_on() || !mirror_upload || p->mstate == Pool::MIRROR_REFUSED || p->mstate == Pool::MIRROR_WANTED)
+        if (!mirror_on() || !mirror_upload || p->mstate == Pool::MIRROR_REFUSED || p->mstate == Pool::MIRROR_WANTED) {
+            // (RX_VK_DGPU: the policy's promoter reads this window's guest-memory binds here, where they actually go.
+            // Stock counted them only under the lock, which this fast path skips; with every pool direct they were all
+            // here and the counters stayed ~0, so no pool was ever a trial candidate. Not in a parallel replay's
+            // segments: the maps are shared, and this path is lock-free by design)
+            if (!par) {
+                direct_by_pool[p->lo].first++;
+                direct_bytes_by_pool[p->lo] += size;
+            }
+            if (dgpu_on() && dgpu_trial.lo == p->lo) p->dgpu_binds++;
             return remember({p->buffer, off, size, 0});
+        }
         if (p->mstate == Pool::MIRROR_ON && p->synced_epoch == mirror_epoch && p->sync_seg <= texture_segment())
             return remember({p->mirror, off, size, 0});
     }

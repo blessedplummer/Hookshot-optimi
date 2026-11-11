@@ -48,7 +48,12 @@ def check_source():
           "(!dgpu_on() || p->dgpu_mirror) && !par && mirror_make(*p)",
           "if (dgpu_on() && !p->dgpu_mirror) {   // (the policy's default: in guest memory until a trial says otherwise)",
           "p->mstate = Pool::MIRROR_REFUSED;",
-          "if (dgpu_on() && dgpu_trial.lo == p->lo) p->dgpu_binds++;"])
+          "if (dgpu_on() && dgpu_trial.lo == p->lo) p->dgpu_binds++;",
+          # (the lock-free fast path counts the window's guest-memory binds too: with every pool direct they all go
+          # through it, and the promoter's evidence was stuck near 0)
+          "if (!par) {",
+          "direct_by_pool[p->lo].first++;",
+          "direct_bytes_by_pool[p->lo] += size;"])
     # (the trials: one at a time, on the game's frames and the recordings' GPU time; the make happens at the pool's
     # next binding, where the uploads are open - a copy recorded at a submission's end would land behind it)
     trials = block(mem, "void dgpu_trials() {")
