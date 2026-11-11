@@ -221,6 +221,16 @@ uint64_t memory_writeback_value(uint64_t guest, uint64_t size, bool* ever);
 /// (Phase 2) the newest submission value whose URGENT write-back reaches into [guest, guest + size) (0: none ever);
 /// *ever set when any urgent write-back ever did. While the split is off this is memory_writeback_value, as before
 uint64_t memory_writeback_urgent_value(uint64_t guest, uint64_t size, bool* ever);
+/// (Phase 2) which table an invalidate waits on. URGENT when the urgent table ever reached the range; FULL once, with
+/// a readback note, when only the full table did — the first read of a region so far written back bulk-only (large,
+/// never read back: the end queues such runs bulk until a readback note marks them urgent). NONE when neither did.
+/// Pure: cut by tests/test_wb_invalidate_tier.py, which pins this first-read-falls-back-then-goes-urgent behavior
+enum class WbWaitTier : uint8_t { None = 0, Urgent = 1, FullThenNote = 2 };
+inline WbWaitTier wb_invalidate_tier(bool urg_ever, bool full_ever) {
+    if (urg_ever) return WbWaitTier::Urgent;
+    if (full_ever) return WbWaitTier::FullThenNote;
+    return WbWaitTier::None;
+}
 void memory_note_readback(uint64_t guest, uint64_t size);   // (PR 430) a CPU read of GPU results: see memory_rb_refresh
 bool memory_rb_refresh(VkCommandBuffer up);
 void memory_rb_recording_begun();   // (hookshot) at a recording's start, on its thread: the submission it joins (memory_rb_refresh)
