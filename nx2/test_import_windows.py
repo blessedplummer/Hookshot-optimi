@@ -34,9 +34,12 @@ def main():
 #include <deque>
 #include <map>
 #include <mutex>
+#include <set>
 #include <vector>
 #define CHECK(x) do { if(!(x)){std::fprintf(stderr,"FAIL:%d %s\\n",__LINE__,#x);std::exit(1);} }while(0)
-struct Pool { uint64_t lo=0,hi=0,range_lo=0,range_hi=0,address=0; bool prefetched=false; };
+struct Pool { uint64_t lo=0,hi=0,range_lo=0,range_hi=0,address=0; bool prefetched=false; bool dgpu_keep=false; };
+// (RX_VK_DGPU: the keep list is empty in this fixture; the policy's own test drives it)
+const std::set<uint64_t>& dgpu_keep_list() { static const std::set<uint64_t> none; return none; }
 struct GuestPool { uint64_t lo,hi; };
 std::vector<GuestPool> guest_pools;
 std::map<uint64_t,Pool> imported;

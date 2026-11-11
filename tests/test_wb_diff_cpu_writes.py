@@ -69,7 +69,8 @@ class ShadowReports(unittest.TestCase):
 
     def test_a_written_binding_past_the_mirror_forgets_its_pages(self):
         bind = body(self.memory, "BufferRef gpu_buffer_bind(uint64_t gpu, uint64_t size, bool written) {")
-        direct = bind[bind.index("p->mstate == Pool::MIRROR_REFUSED) {"):]
+        # (the direct branch: the locked path's condition - the fast path's also names MIRROR_WANTED)
+        direct = bind[bind.rindex("if (!mirror_on() || !mirror_upload || p->mstate == Pool::MIRROR_REFUSED"):]
         direct = direct[:direct.index("return remember(")]
         self.assertIn("if (written) shadow_forget(*p, off,", direct)   # (the GPU writes guest memory itself there)
 

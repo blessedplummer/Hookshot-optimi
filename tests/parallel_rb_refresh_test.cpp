@@ -72,6 +72,8 @@ void memory_note_gpu_write(uint64_t gpu, uint64_t size);
 bool memory_rb_refresh(VkCommandBuffer up);
 #include "rb_bufferref.inc"
 std::mutex pools_mu;
+// (RX_VK_DGPU: off here; the fixture drives the readback refresh, and the policy's own test drives the switch)
+bool dgpu_active() { return false; }
 #include "rb_pool.inc"
 std::map<uint64_t, Pool> imported;
 uint64_t mirror_epoch = 0;

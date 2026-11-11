@@ -42,6 +42,10 @@ struct ParLock { ParLock() {} ~ParLock() {} };
 static void texture_gpu_wrote(uint64_t, uint64_t) { ++texture_writes; }
 static void rb_hazard_locked(uint64_t lo, uint64_t hi) { ++hazards; hazard_lo = lo; hazard_hi = hi; }
 static bool mirror_on() { return mirrors; }
+// (RX_VK_DGPU: off, as the stock paths this fixture checks are; the policy's own test drives the switch)
+static bool dgpu_active() { return false; }
+static bool dgpu_pool_mirrored(bool, bool) { return true; }
+static void dgpu_note_read_bind(Pool&) {}
 static Pool* pool_of(uint64_t guest, uint64_t size) {
     ++lookups;
     return have_pool && guest >= pool.lo && guest <= pool.hi && size <= pool.hi - guest ? &pool : nullptr;

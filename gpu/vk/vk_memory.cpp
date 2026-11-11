@@ -28,6 +28,7 @@
 #include "vk_internal.h"
 #include "vk_texture.h"   // (upload_command_buffer)
 #include "vk_gprof.h"      // (RX_VK_PASS_TIMING)
+#include "vk_paths.h"      // (RX_VK_DGPU's keep list: the game folder, as hookshot_options.ini's)
 #include "import_hold.h"
 #include "mirror_inherit.h"
 #ifdef __linux__
@@ -80,7 +81,17 @@ struct Pool {
     VmaAllocation shadow_alloc = nullptr;
     VkDeviceAddress shadow_address = 0;
     std::vector<uint64_t> shadow_known;   // (a bit a page)
+    // (RX_VK_DGPU) what the policy knows of this pool: the GPU wrote a binding of it (a render target: its device-local
+    // mirror is the authoritative copy), or the GPU only ever read it (static data: direct in guest memory, no mirror),
+    // and whether a measured trial (or the keep list) proved a static pool pays for a mirror after all
+    bool dgpu_wrote = false;
+    bool dgpu_keep = false;
+    bool dgpu_read = false;       // (a page of it the CPU read: its write-back is the sparse page set, not nothing)
+    bool dgpu_refused = false;    // (a trial said the mirror does not pay: not tried again this run)
+    uint32_t dgpu_read_binds = 0; // (read bindings served from guest memory: the trial candidates' order)
 };
+const std::set<uint64_t>& dgpu_keep_list();   // (below: RX_VK_DGPU's keep list, read once)
+inline bool dgpu_policy_on(bool requested, bool mirrors);
 uint64_t mem_rec_value = 0, mem_completed = 0;   // (the recording being made, and the GPU's progress)
 
 struct GuestPool {
@@ -1846,7 +1857,8 @@ void bg_drain() {
             continue;
         }
         if (imp != imported.end()) retire_pool(imp);
-        imported.emplace(lo, p);
+        auto in = imported.emplace(lo, p);
+        in.first->second.dgpu_keep = dgpu_keep_list().count(lo) != 0;   // (RX_VK_DGPU: a pool a trial kept mirrored)
         guest_pages_set(p.lo, p.hi, p.address);
     }
 }
@@ -2040,6 +2052,7 @@ Pool* pool_lookup(uint64_t guest, uint64_t size) {
             if (o != imported.end()) retire_pool(o);
         }
         imp = imported.emplace(p.lo, p).first;
+        imp->second.dgpu_keep = dgpu_keep_list().count(p.lo) != 0;   // (RX_VK_DGPU: a pool a trial kept mirrored)
         guest_pages_set(p.lo, p.hi, p.address);
         if (chunk) prefetch_chunks(p.lo, p.hi, chunk);
         if (overlapped.size() > 1) {
@@ -2085,6 +2098,154 @@ bool mirror_on() {
         return v;
     }();
     return on != 0;
+}
+
+// ---- (RX_VK_DGPU) one policy switch for a discrete GPU: the engine's memory as a PC's ----
+// The console's memory is one pool the CPU and the GPU both see. This emulation keeps that: every pool gets a VRAM
+// mirror and every GPU write is copied back, so both copies agree at every submit. A PC engine does not pay that: a
+// render target lives in VRAM and is brought to system memory only where the CPU reads it; static data (buffers the
+// GPU never writes) is never mirrored at all; and a mirror exists only where it pays. At 4K this CPU-bound the replay
+// (issue #2099: 35.6 fps with 3879 write-back runs, 3344.4 MB compared, 199 of 3000 readbacks waiting 16.78 ms each
+// over 600 submits, all in the memory sync, GPU starved): the sync work, not the GPU, is what the policy removes.
+// RX_VK_DGPU=1: on; unset (or 0): every path below is stock (no behavioral change, no cost while off).
+// The pieces key off each other:
+// - a pool the GPU has never written is static: bound in guest memory, never mirrored, shadowed or captured. A measured
+//   per-pool trial may keep one mirrored (item 3), remembered in hookshot_dgpu_mirrors.txt beside the executable, as
+//   hookshot_options.ini is (the pattern its own keep list uses: the addresses are the same every run).
+// - a pool the GPU writes gets its mirror as the authoritative device-local copy (a render target), and a write-back
+//   copies only the pages the CPU read (memory_note_readback, rb_pages), resolved at the submission's end.
+// - the write-back diff's shadows are not made: page-sparse copies are already tiny, and the pass and its barriers are
+//   exactly the GPU work the readbacks wait on.
+bool dgpu_on() {
+    static const bool on = [] {
+        const char* e = getenv("RX_VK_DGPU");
+        const bool v = e && e[0] && e[0] != '0';
+        if (v) {
+            logf("vk: RX_VK_DGPU: a discrete GPU's memory policy; static pools direct, render targets sparse, mirrors "
+                 "only where a trial keeps them%s", mirror_on() ? "" : " (RX_VK_MIRROR=0: no mirrors, the policy does nothing)");
+        }
+        return v;
+    }();
+    return on;
+}
+/// (the policy does anything only with the mirrors it tunes; RX_VK_MIRROR=0 is the older switch and wins)
+bool dgpu_active() {
+    static const bool v = dgpu_policy_on(dgpu_on(), mirror_on());
+    return v;
+}/// (RX_VK_DGPU) Whether a pool gets a mirror at all: a render target (the GPU wrote it) must, since its device-local
+/// copy is the one the GPU writes; static data gets one only when a trial (or the keep list) proved it pays.
+// ---- (RX_VK_DGPU) policy decisions (tests/test_dgpu_policy.py cuts this block whole) ----
+inline bool dgpu_pool_mirrored(bool wrote_gpu, bool trial_keep) {
+    return wrote_gpu || trial_keep;
+}
+
+/// (RX_VK_DGPU) The switch's gate, pure: the policy asked for, and the mirrors it tunes both on (RX_VK_MIRROR=0 is the
+/// older switch and wins). (cut whole by tests/test_dgpu_policy.py)
+inline bool dgpu_policy_on(bool requested, bool mirrors) {
+    return requested && mirrors;
+}
+
+/// (RX_VK_DGPU) The runs of [lo, hi) a write-back copies: only the pages in the CPU's read set (rb_pages: the pages a
+/// readback made the CPU read), merged page by page. A page the CPU never read keeps its device-local bytes; guest
+/// memory is not brought up to date for it. `read` takes a page number. (pure: the caller owns the read set; cut whole
+/// by tests/test_dgpu_policy.py)
+template <typename Read>
+void dgpu_writeback_runs(uint64_t lo, uint64_t hi, uint64_t page_shift, Read&& read,
+                         std::vector<std::pair<uint64_t, uint64_t>>& out) {
+    if (hi <= lo) return;
+    uint64_t run_lo = 0, run_hi = 0;
+    bool have = false;
+    for (uint64_t page = lo >> page_shift; page <= (hi - 1) >> page_shift; page++) {
+        if (!read((uint32_t)page)) continue;
+        const uint64_t a = std::max(page << page_shift, lo), b = std::min((page + 1) << page_shift, hi);
+        if (have && run_hi == a) {
+            run_hi = b;
+            continue;
+        }
+        if (have) out.push_back({run_lo, run_hi});
+        run_lo = a, run_hi = b, have = true;
+    }
+    if (have) out.push_back({run_lo, run_hi});
+}
+
+/// (RX_VK_DGPU) Whether a trial's two windows say a static pool's mirror pays: the GPU took at least `margin` and
+/// `floor_ms` less time a frame with it. (pure: both numbers are GPU ms a frame, measured the same way either side; cut
+/// whole by tests/test_dgpu_policy.py)
+inline bool dgpu_trial_keeps(double direct_ms, double mirrored_ms, double margin, double floor_ms) {
+    return direct_ms > 0 && mirrored_ms > 0 && mirrored_ms * (1.0 + margin) + floor_ms <= direct_ms;
+}
+
+/// (RX_VK_DGPU) The trial's clock, pure: 0 idle (nothing to do yet), 1 settle the mirror (a window after it was made),
+/// 2 the measured window with the mirror, 3 decide now. (cut whole by tests/test_dgpu_policy.py)
+inline int dgpu_trial_step(int phase, uint64_t epoch, uint64_t start, uint64_t window) {
+    if (phase == 1) return epoch >= start + window ? 2 : 1;
+    if (phase == 2) return epoch >= start + window ? 3 : 2;
+    return 0;
+}
+// ---- end of the policy decisions ----
+// (the trial's numbers: a window is 240 submissions (~40 frames at the game's six a submit). Only a GPU that is the
+// limit is tried at all: a starved one has no time for a mirror to save, and at 4K the policy's A/B must not carry
+// trial stutters. Keep needs 3% and 0.05 ms; the keep list takes only a clear one, 10%.)
+constexpr uint64_t kDgpuWindow = 240;
+constexpr double kDgpuGpuBoundMs = 6.0;
+constexpr double kDgpuMargin = 0.03, kDgpuFloorMs = 0.05, kDgpuKeepMargin = 0.10;
+
+/// (RX_VK_DGPU) The pools the trial's keep list holds, by guest start. Empty unless the policy is on.
+const std::set<uint64_t>& dgpu_keep_list() {
+    static const std::set<uint64_t> v = [] {
+        std::set<uint64_t> r;
+        if (!dgpu_on()) return r;
+        char exe[MAX_PATH];
+        const DWORD n = game_module_path(exe, MAX_PATH);
+        if (!n || n >= MAX_PATH) return r;
+        std::string dir(exe, n);
+        dir = dir.substr(0, dir.find_last_of("\\/") + 1) + "hookshot_dgpu_mirrors.txt";
+        if (FILE* f = fopen(dir.c_str(), "r")) {
+            char line[64];
+            while (fgets(line, sizeof line, f))
+                if (const uint64_t a = strtoull(line, nullptr, 16)) r.insert(a);
+            fclose(f);
+        }
+        if (!r.empty()) logf("vk: RX_VK_DGPU: %zu pools kept mirrored from earlier trials (%s)", r.size(), dir.c_str());
+        return r;
+    }();
+    return v;
+}
+/// (RX_VK_DGPU) A trial's winner, for later runs (appended as it is found; the file sits beside the executable)
+void dgpu_keep_add(uint64_t lo) {
+    char exe[MAX_PATH];
+    const DWORD n = game_module_path(exe, MAX_PATH);
+    if (!n || n >= MAX_PATH) return;
+    std::string dir(exe, n);
+    dir = dir.substr(0, dir.find_last_of("\\/") + 1) + "hookshot_dgpu_mirrors.txt";
+    if (FILE* f = fopen(dir.c_str(), "a")) fprintf(f, "%llx\n", (unsigned long long)lo), fclose(f);
+}
+
+// ---- (RX_VK_DGPU) the measured per-pool trial (item 3) ----
+// A static pool bound millions of times may still pay for a mirror: whether a mirror pays is a question about this card
+// and this scene, so it is measured, not guessed. The pattern is Triforce's demote_trials in its vk_memory.cpp, which
+// asks the same question the other way round (should a mirrored pool go back to guest memory) and keeps its answers in
+// triforce_mirror_keep.txt; here a static pool is measured direct against mirrored and the winners are kept. One trial
+// at a time, only while the GPU is the limit: a window of kDgpuWindow submissions (about 40 frames at the game's six a
+// submit) of the recording timestamps' GPU time, direct; then the mirror is made, a window settles it and a window is
+// measured. Kept when the GPU's frame is at least kDgpuMargin and kDgpuFloorMs faster mirrored; a clear win
+// (kDgpuKeepMargin) also goes to hookshot_dgpu_mirrors.txt, since the pools sit at the same addresses every run.
+struct DgpuTrial {
+    uint64_t lo = 0;      // (the pool under trial; 0: none)
+    int phase = 0;        // (1 settle the mirror, 2 the measured window)
+    uint64_t start = 0;   // (the epoch the phase began at)
+    double direct_ms = 0; // (the quiet window's GPU ms a frame, before the mirror was made)
+};
+DgpuTrial dgpu_trial;
+std::vector<uint64_t> dgpu_candidates;   // (static pools read often enough to ask about, by guest start)
+uint64_t dgpu_win_epoch = 0, dgpu_win_ns = 0, dgpu_win_frames = 0;
+double dgpu_win_ms = -1;   // (the last complete window's GPU ms a frame; -1: none yet)
+
+/// (RX_VK_DGPU) A read binding served direct from a static pool: its count queues the pool for the trial once
+void dgpu_note_read_bind(Pool& p) {
+    if (p.dgpu_read_binds == 0xffffffffu) return;
+    if (++p.dgpu_read_binds == 50000 && p.hi - p.lo >= (2u << 20) && dgpu_candidates.size() < 8)
+        dgpu_candidates.push_back(p.lo);
 }
 
 /// (hookshot, smoothness) A read binding in a chunk not imported yet: its import goes to the background thread and the binding is
@@ -2270,6 +2431,9 @@ void retire_pool(std::map<uint64_t, Pool>::iterator it) {
 }
 int64_t st_sync_bytes, st_sync_copies, st_wb_bytes, st_mirrors;
 int64_t st_sync_live_pages, st_sync_cap_pages, st_sync_old_pages;   // (mirror syncs' dirty pages: live / this submit's capture / an earlier one's)
+// (RX_VK_DGPU: the sparse write-back's pages copied and the bytes it left device-local, and the trials' outcomes)
+int64_t st_dgpu_wb_pages, st_dgpu_wb_dropped;
+int64_t st_dgpu_trials, st_dgpu_trial_kept;
 std::unordered_map<uint64_t, int64_t> live_by_pool;
 std::unordered_map<uint64_t, std::pair<int64_t, int>> direct_by_pool;   // (bindings the GPU reads in guest memory: count, state)
 std::unordered_map<uint64_t, uint64_t> direct_bytes_by_pool;           // (and the bytes of those bindings: what the GPU may read over PCIe, a binding's whole range)
@@ -2427,7 +2591,21 @@ void memory_note_readback(uint64_t guest, uint64_t size) {
     static const bool off = getenv("RX_VK_NO_RB_REFRESH") != nullptr;
     if (off || !size || size > 0x4000) return;   // (small results only: meters and counters)
     std::lock_guard lk(pools_mu);
+    if (dgpu_active()) {   // (RX_VK_DGPU: the pool has a page the CPU reads, so its write-back is sparse, not skipped)
+        auto pit = imported.upper_bound(guest);
+        if (pit != imported.begin() && guest >= (--pit)->second.lo && guest < pit->second.hi) pit->second.dgpu_read = true;
+    }
     for (uint64_t pg = guest >> kPageShift; pg <= (guest + size - 1) >> kPageShift; pg++) rb_pages[(uint32_t)pg] = mirror_epoch;
+}
+/// (RX_VK_DGPU) The policy's answer for a readback's first read: the pool holding it is one the GPU writes, so the read
+/// must wait for the submission that ends with its sparse write-back (stock's write-back value says nothing yet).
+bool memory_pool_gpu_written(uint64_t guest, uint64_t size) {
+    if (!dgpu_active() || !size) return false;
+    std::lock_guard lk(pools_mu);
+    auto it = imported.upper_bound(guest);
+    if (it == imported.begin()) return false;
+    --it;
+    return guest >= it->second.lo && size <= it->second.hi - guest && it->second.dgpu_wrote;
 }
 void memory_note_gpu_write(uint64_t gpu, uint64_t size) {
     if (!size) return;
@@ -2549,6 +2727,7 @@ int memory_guest_imported(uint64_t lo, uint64_t hi) {
 }
 
 bool mirror_make(Pool& pool);   // (below)
+void dgpu_trials();             // (below: RX_VK_DGPU's per-pool trial)
 /// The mirrored pools, for the submit-time capture (memory_capture_submit) (pools_mu held)
 void publish_cap_ranges() {
     std::vector<std::pair<uint64_t, uint64_t>> v;
@@ -2683,6 +2862,12 @@ BufferRef gpu_buffer_bind(uint64_t gpu, uint64_t size, bool written) {
         if (p->last_value < mem_rec_value) p->last_value = mem_rec_value;
         if (!mirror_on() || !mirror_upload || p->mstate == Pool::MIRROR_REFUSED || p->mstate == Pool::MIRROR_WANTED)
             return remember({p->buffer, off, size, 0});
+        // (RX_VK_DGPU) static data: the GPU never wrote this pool, so guest memory is the only copy and the lock below is
+        // not needed to say so (a late write flips dgpu_wrote and the next binding mirrors it)
+        if (dgpu_active() && p->mstate == Pool::MIRROR_NONE && !dgpu_pool_mirrored(p->dgpu_wrote, p->dgpu_keep)) {
+            dgpu_note_read_bind(*p);
+            return remember({p->buffer, off, size, 0});
+        }
         if (p->mstate == Pool::MIRROR_ON && p->synced_epoch == mirror_epoch && p->sync_seg <= texture_segment())
             return remember({p->mirror, off, size, 0});
     }
@@ -2706,7 +2891,12 @@ BufferRef gpu_buffer_bind(uint64_t gpu, uint64_t size, bool written) {
     tl = {p, pools_gen.load(std::memory_order_relaxed)};
     if (p->last_value < mem_rec_value) p->last_value = mem_rec_value;
     const uint64_t off = guest - p->lo;
-    if (!mirror_on() || !mirror_upload || p->mstate == Pool::MIRROR_REFUSED) {
+    if (written) p->dgpu_wrote = true;   // (RX_VK_DGPU: a render target from now on: its device-local copy is the one it writes)
+    // (RX_VK_DGPU) static data stays direct: never-written pools are not mirrored (item 2 of the policy), so a read binding
+    // of one is served from guest memory with no mirror, no sync and no capture. A trial may keep it mirrored (dgpu_keep).
+    const bool dgpu_static = dgpu_active() && p->mstate == Pool::MIRROR_NONE && !dgpu_pool_mirrored(p->dgpu_wrote, p->dgpu_keep);
+    if (!mirror_on() || !mirror_upload || p->mstate == Pool::MIRROR_REFUSED || dgpu_static) {
+        if (!written && dgpu_static) dgpu_note_read_bind(*p);
         if (written) note_direct_write(*p, off, size);
         if (mirror_on()) { auto& e = direct_by_pool[p->lo]; e.first++, e.second = mirror_upload ? (int)p->mstate : 9; direct_bytes_by_pool[p->lo] += size; }
         // (hookshot) written by the GPU in guest memory itself, past the mirror (bound outside a recording's uploads): the
@@ -2980,15 +3170,17 @@ void memory_begin_submission() {
         for (Pool* p : mirror_wanted) want += p->hi - p->lo;
         if (mirror_epoch % 64 == 0 || mirror_bytes + want > mirror_budget()) mirrors_give_back(want);
     }
-    if (mirror_wanted.empty()) return;
-    for (Pool* p : mirror_wanted) mirror_make(*p);
-    mirror_wanted.clear();
-    publish_cap_ranges();
-    static uint64_t logged_at;
-    if (mirror_bytes >> 28 != logged_at) {
-        logged_at = mirror_bytes >> 28;
-        logf("vk: %lld pools mirrored in VRAM (%llu MB)", (long long)st_mirrors, (unsigned long long)(mirror_bytes >> 20));
+    if (!mirror_wanted.empty()) {
+        for (Pool* p : mirror_wanted) mirror_make(*p);
+        mirror_wanted.clear();
+        publish_cap_ranges();
+        static uint64_t logged_at;
+        if (mirror_bytes >> 28 != logged_at) {
+            logged_at = mirror_bytes >> 28;
+            logf("vk: %lld pools mirrored in VRAM (%llu MB)", (long long)st_mirrors, (unsigned long long)(mirror_bytes >> 20));
+        }
     }
+    dgpu_trials();   // (RX_VK_DGPU: a static pool's measured trial, if one is due; does nothing while the switch is off)
 }
 
 /// (hookshot) Before a command buffer's parallel segments: every mirrored pool synced once, into the replay thread's
@@ -3015,6 +3207,12 @@ bool mirror_make(Pool& pool) {
     Pool* p = &pool;
     {
         const uint64_t n = p->hi - p->lo;
+        // (RX_VK_DGPU: static data is not mirrored (item 2). The bind path serves such a pool direct and never queues it
+        // here; this is the backstop for one queued before its last write was known, or for a keep-list pool removed.)
+        if (dgpu_active() && !dgpu_pool_mirrored(p->dgpu_wrote, p->dgpu_keep)) {
+            p->mstate = Pool::MIRROR_NONE;
+            return false;
+        }
         // (hookshot: RX_VK_MIRROR_TIGHT=1, none while VRAM is 90% full. Off: 8 GB cards sit there all the time, and without their mirrors
         // the GPU read game memory over PCIe)
         static const bool tight_rule = getenv("RX_VK_MIRROR_TIGHT") != nullptr;
@@ -3143,6 +3341,72 @@ bool mirror_make(Pool& pool) {
         st_sync_bytes += (int64_t)n;
     }
     return true;
+}
+
+// ---- (RX_VK_DGPU) the trial's clock, at a submission's start (pools_mu held) ----
+void dgpu_trials() {
+    if (!dgpu_active()) return;
+    // (a window of GPU time from the recordings' timestamps: the same measure either side of the mirror)
+    if (!dgpu_win_epoch || mirror_epoch < dgpu_win_epoch + kDgpuWindow) return;
+    const uint64_t frames = texture_frame_no(), ns = gpu_time_total_ns();
+    if (frames > dgpu_win_frames && ns > dgpu_win_ns)
+        dgpu_win_ms = (double)(ns - dgpu_win_ns) / (double)(frames - dgpu_win_frames) / 1e6;
+    dgpu_win_epoch = mirror_epoch, dgpu_win_ns = ns, dgpu_win_frames = frames;
+    const int step = dgpu_trial_step(dgpu_trial.phase, mirror_epoch, dgpu_trial.start, kDgpuWindow);
+    if (dgpu_trial.phase) {
+        if (step == 1) return;   // (settling)
+        if (step == 2) {         // (settled: the measured window starts now)
+            dgpu_trial.phase = 2, dgpu_trial.start = mirror_epoch;
+            return;
+        }
+        // (measured: does the mirror pay?)
+        auto it = imported.find(dgpu_trial.lo);
+        Pool* p = it == imported.end() ? nullptr : &it->second;
+        const uint64_t lo = dgpu_trial.lo;
+        const double direct = dgpu_trial.direct_ms, mirrored = dgpu_win_ms;
+        dgpu_trial = {};
+        st_dgpu_trials++;
+        if (p && dgpu_trial_keeps(direct, mirrored, kDgpuMargin, kDgpuFloorMs)) {
+            st_dgpu_trial_kept++;
+            const bool clear = dgpu_trial_keeps(direct, mirrored, kDgpuKeepMargin, kDgpuFloorMs);
+            if (clear) dgpu_keep_add(lo);
+            logf("vk: RX_VK_DGPU: pool %#llx (%llu MB): trial: direct %.2f ms a frame, mirrored %.2f: the mirror stays%s",
+                 (unsigned long long)lo, (unsigned long long)((p->hi - p->lo) >> 20), direct, mirrored,
+                 clear ? " (kept for later runs)" : "");
+        } else if (p) {
+            // (not worth its VRAM: back to guest memory for this run. The pool's contents are unchanged, so nothing has
+            // to be copied back; the mirror goes the way mirrors_give_back takes one.)
+            mirror_free(*p);
+            p->mstate = Pool::MIRROR_REFUSED;
+            p->dgpu_refused = true;
+            p->dgpu_keep = false;
+            logf("vk: RX_VK_DGPU: pool %#llx (%llu MB): trial: direct %.2f ms a frame, mirrored %.2f: back to guest memory",
+                 (unsigned long long)lo, (unsigned long long)((p->hi - p->lo) >> 20), direct, mirrored);
+        }
+        return;
+    }
+    // (idle: start the next one, only while the GPU is the limit - a starved one has no time for a mirror to save - and
+    // only a few a run, so the trials cannot become the cost)
+    if (dgpu_win_ms < kDgpuGpuBoundMs || st_dgpu_trials >= 4) return;
+    while (!dgpu_candidates.empty()) {
+        const uint64_t lo = dgpu_candidates.front();
+        dgpu_candidates.erase(dgpu_candidates.begin());
+        auto it = imported.find(lo);
+        if (it == imported.end()) continue;
+        Pool* p = &it->second;
+        if (p->dgpu_wrote || p->dgpu_keep || p->dgpu_refused || p->mstate != Pool::MIRROR_NONE) continue;
+        if (p->hi - p->lo > (64ull << 20)) continue;
+        p->dgpu_keep = true;
+        if (!mirror_make(*p)) {
+            p->dgpu_keep = false;
+            continue;
+        }
+        publish_cap_ranges();
+        dgpu_trial = {lo, 1, mirror_epoch, dgpu_win_ms};
+        logf("vk: RX_VK_DGPU: pool %#llx (%llu MB): trial, %u read bindings: mirrored at %.2f ms a frame (direct)",
+             (unsigned long long)lo, (unsigned long long)((p->hi - p->lo) >> 20), p->dgpu_read_binds, dgpu_win_ms);
+        return;
+    }
 }
 
 // ---- the write-back's diff (hookshot, 2026-11-09) ----
@@ -3462,6 +3726,15 @@ void memory_end_submission(VkCommandBuffer cmd) {
                      (long long)st_wbd_known_game, (long long)st_wbd_known_collected, (long long)st_wbd_known_replay);
             st_wbd_runs = st_wbd_bytes = st_wbd_fill_pages = 0;
             st_wbd_known_game = st_wbd_known_collected = st_wbd_known_replay = 0;
+            if (dgpu_active()) {
+                // (RX_VK_DGPU: what the sparse write-back did - the pages copied and what stayed device-local, and the
+                // trials' outcomes. Stock has neither line nor counters.)
+                static int64_t l_pages, l_dropped, l_trials, l_kept;
+                logf("vk: RX_VK_DGPU (600 submits): write-back %lld pages copied, %.1f MB left device-local; %lld trials, %lld mirrors kept",
+                     (long long)(st_dgpu_wb_pages - l_pages), (st_dgpu_wb_dropped - l_dropped) / 1048576.0,
+                     (long long)(st_dgpu_trials - l_trials), (long long)(st_dgpu_trial_kept - l_kept));
+                l_pages = st_dgpu_wb_pages, l_dropped = st_dgpu_wb_dropped, l_trials = st_dgpu_trials, l_kept = st_dgpu_trial_kept;
+            }
             std::vector<std::pair<int64_t, uint64_t>> top;
             for (const auto& [lo, k] : live_by_pool) top.push_back({k, lo});
             std::sort(top.rbegin(), top.rend());
@@ -3519,7 +3792,10 @@ void memory_end_submission(VkCommandBuffer cmd) {
         std::vector<VkBufferCopy> runs;
         // (the write-back's diff: the runs of pools with a shadow, as chunks of 64 KB at most, for one pass after the loop)
         const bool diff = wb_diff_on() && wbd_pipe_ready();
-        if (diff) shadows_forget_written(), shadows_reap(), shadows_check_room();
+        // (RX_VK_DGPU: no diff pass under the policy. Its barriers and dispatch are GPU work the captures' readback waits
+        // on; the sparse runs it would compare are a few pages, so the plain copies below are cheaper than the pass.)
+        const bool dgpu_wb = dgpu_active();
+        if (diff && !dgpu_wb) shadows_forget_written(), shadows_reap(), shadows_check_room();
         static thread_local std::vector<WbdChunk> chunks;
         struct ChunkSrc { Pool* p; uint64_t at, len; };
         static thread_local std::vector<ChunkSrc> chunk_src;   // (for the whole copy, when no table is free)
@@ -3537,12 +3813,45 @@ void memory_end_submission(VkCommandBuffer cmd) {
                     runs.push_back({w.lo, w.lo, w.hi - w.lo});
             }
             cut_cpu_words(*p, runs);
+            // (RX_VK_DGPU) A render target's write-back is sparse: only the pages the CPU read (rb_pages, the readback
+            // registry) go back to guest memory, page by page and merged. Resolved here, at the submission's end, not at
+            // the binding: a readback replayed after the binding must still count. The pages nobody reads keep their
+            // device-local bytes; guest memory is not brought up to date for them (that whole-range copy was the sync
+            // cost: 3344.4 MB compared over 600 submits at 4K, issue #2099). The expiry matches memory_rb_refresh's.
+            if (dgpu_active() && !runs.empty()) {
+                static thread_local std::vector<std::pair<uint64_t, uint64_t>> sparse;
+                sparse.clear();
+                uint64_t kept_bytes = 0;
+                for (const VkBufferCopy& r : runs) {
+                    const uint64_t lo = r.dstOffset, hi = r.dstOffset + r.size;
+                    const size_t before = sparse.size();
+                    dgpu_writeback_runs(lo, hi, kPageShift, [&](uint32_t page) {
+                        const auto it = rb_pages.find(page);
+                        return it != rb_pages.end() && it->second + 600 >= mirror_epoch;
+                    }, sparse);
+                    uint64_t page_bytes = 0;
+                    for (size_t k = before; k < sparse.size(); k++) page_bytes += sparse[k].second - sparse[k].first;
+                    kept_bytes += page_bytes;
+                    st_dgpu_wb_dropped += (int64_t)(r.size - page_bytes);
+                }
+                runs.clear();
+                uint64_t prev_end = 0;
+                for (const auto& [lo, hi] : sparse) {
+                    if (!runs.empty() && lo <= prev_end) {   // (runs of the same pool: adjacent pages merge)
+                        runs.back().size = std::max(runs.back().size, hi - runs.back().dstOffset);
+                    } else {
+                        runs.push_back({lo, lo, hi - lo});
+                    }
+                    prev_end = hi;
+                }
+                st_dgpu_wb_pages += (int64_t)sparse.size();
+            }
             if (runs.empty()) continue;
             checkpoint_mark(cmd, p->lo, 'b');
             uint64_t run_bytes = 0;
             for (const VkBufferCopy& r : runs) run_bytes += r.size;
-            if (diff && !p->shadow && run_bytes >= (256u << 10)) shadow_make(*p);   // (a pool whose write-back is worth one, as VRAM allows)
-            if (diff && p->shadow && p->address && p->mirror) {
+            if (!dgpu_wb && diff && !p->shadow && run_bytes >= (256u << 10)) shadow_make(*p);   // (a pool whose write-back is worth one, as VRAM allows)
+            if (!dgpu_wb && diff && p->shadow && p->address && p->mirror) {
                 VkBufferDeviceAddressInfo mda{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
                 mda.buffer = p->mirror;
                 const VkDeviceAddress mirror_address = vkGetBufferDeviceAddress(dev.device, &mda);

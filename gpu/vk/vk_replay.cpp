@@ -530,6 +530,10 @@ void ub_prune(uint64_t done) {
 
 } // namespace
 
+int64_t gpu_time_total_ns() {
+    return st_gpu_ns;
+}
+
 uint64_t ub_generation() {
     return ub_gen;
 }
@@ -2281,7 +2285,12 @@ void invalidate(uint64_t gpu, uint64_t size) {
     if (size) {
         static const bool off = getenv("RX_VK_NO_READBACK_WAIT") != nullptr;
         bool ever = false;
-        if (!off && (memory_writeback_value(host->gpu_guest(gpu), size, &ever), ever)) {
+        // (RX_VK_DGPU) the policy writes back only the pages the CPU reads, so this range's first read has no write-back
+        // value yet (ever false). It is still a read of GPU results: note the pages (the submission's end copies them
+        // back) and wait once for that submission, as an unknown range did before the readback pages existed.
+        const bool dgpu_first = !off && (memory_writeback_value(host->gpu_guest(gpu), size, &ever), !ever) &&
+                                memory_pool_gpu_written(host->gpu_guest(gpu), size);
+        if (!off && (ever || dgpu_first)) {
             memory_note_readback(host->gpu_guest(gpu), size);   // (PR 430: the CPU may write it back: memory_rb_refresh)
             static std::atomic<int64_t> calls{0}, waited{0}, ns{0};
             const auto w0 = std::chrono::steady_clock::now();
@@ -2306,6 +2315,11 @@ void invalidate(uint64_t gpu, uint64_t size) {
                 }
                 w = true;
             }
+            // (RX_VK_DGPU: a page's first read. Its sparse write-back is recorded by the submission the readback sits in,
+            // which ends after this op, so waiting for the queue covers the GPU writes handed over before it; the current
+            // submission's own write-back lands at its end, and from the next read the range has a write-back value and
+            // takes the ordinary wait above. One frame of a page's first contents may still be the frame before's.)
+            if (dgpu_first && !w) wait_queue_empty(), w = true;
             if (w) {
                 waited++;
                 const int64_t d = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - w0).count();

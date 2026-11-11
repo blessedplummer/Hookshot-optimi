@@ -178,6 +178,11 @@ void memory_pool_created(uint64_t gpu, uint64_t size);
 /// Whether guest memory in [lo, hi) is in an imported pool, live or retired (the GPU may read or write it)
 int memory_guest_imported(uint64_t lo, uint64_t hi);
 void memory_stats(int64_t* mirrors, uint64_t* mirror_mb, int64_t* sync_bytes, int64_t* sync_copies, int64_t* wb_bytes);
+/// (vk_replay.cpp, RX_VK_DGPU) the GPU time in the recordings so far, ns: the per-pool mirror trials compare two windows
+int64_t gpu_time_total_ns();
+/// (vk_memory.cpp, RX_VK_DGPU) whether the pool holding [guest, guest + size) is one the GPU has written: its pages the
+/// CPU reads are the ones the policy writes back, so the first read of one must wait for the submission to end
+bool memory_pool_gpu_written(uint64_t guest, uint64_t size);
 // Page write generations (vk_memory.cpp, after totk-pc-recomp's vk_memory.c): at each submit the guest pages the CPU
 // wrote since the last one (the soft write watch) are stamped with a new generation; a texture uploaded at
 // generation g is stale when a page of its storage carries a newer one. GPU writes into guest memory that textures
