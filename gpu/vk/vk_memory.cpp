@@ -3196,6 +3196,18 @@ constexpr int kDtBaselineFrames = 40, kDtSettleFrames = 15, kDtMeasureFrames = 9
               kDtConfirmFrames = 40;
 constexpr double kDtGpuLimitMs = 6.0, kDtLoadMs = 3.0, kDtPromotePct = 0.03, kDtPromoteMs = 0.05,
                  kDtDemoteSlackPct = 0.20, kDtDemoteSlackMs = 0.5, kDtDemoteClear = 1.5;
+/// A trial's windows in a run: gameplay windows are noisy (a 600-submit window sees dialogs come and go), so a run
+/// gets a few trials and no more - the uncapped first cut ran 57 of them and wrote 32 verdicts into the keep file
+/// from windows nobody would trust (deepseek's cap, credited: their design stops at 4).
+constexpr int kDtTrialMax = 4;
+/// Only a CLEAR winner goes to the keep file, which outlives the run: 10% and 0.05 ms a frame either way
+/// (deepseek's kDgpuKeepMargin, credited). The in-run keep uses the softer margins above; the file is for
+/// verdicts the next run can start from without re-trialing.
+constexpr double kDtKeepPct = 0.10;
+/// The keep-file test, either direction: `after` beat `base` by kDtKeepPct and kDtPromoteMs
+bool dgpu_variant_clear(double base_ms, double after_ms) {
+    return base_ms > 0 && after_ms > 0 && after_ms < base_ms * (1.0 - kDtKeepPct) && base_ms - after_ms >= kDtPromoteMs;
+}
 /// A static pool's mirror must WIN to be kept; a demoted pool's direct mapping must only not LOSE (Triforce's
 /// slack: a mirror that costs a little still buys the GPU's reads, and the syncs it removes are CPU-side)
 bool dgpu_variant_ok(int dir, double base_ms, double after_ms) {
@@ -3268,6 +3280,7 @@ void dgpu_trial_run() {
         return it == imported.end() ? nullptr : &it->second;
     };
     if (!dgpu_trial.phase) {   // (pick: the first eligible pool in address order, so a run's order is its own)
+        if (st_dgpu_trials >= kDtTrialMax) return;   // (a few trials a run, no more: gameplay windows are noisy)
         for (auto& [lo, p] : imported) {
             if (p.dgpu_trial || p.dgpu_trial_fails >= 2 || dgpu_keep_verdict(lo)) continue;
             if (p.last_value + 240 < mem_rec_value) continue;   // (idle: its A/B would measure the scene, not the pool)
@@ -3339,7 +3352,8 @@ void dgpu_trial_run() {
                 p->mstate = Pool::MIRROR_REFUSED, p->dgpu_direct = true;
             }
             p->dgpu_trial = false;
-            dgpu_keep_add(lo, dir > 0 ? 'M' : 'D');
+            if (dgpu_variant_clear(dgpu_trial.base_ms, dgpu_trial.after_ms))   // (the file takes only a clear one)
+                dgpu_keep_add(lo, dir > 0 ? 'M' : 'D');
             st_dgpu_kept++;
             dgpu_trial = {};
             break;
@@ -3354,7 +3368,8 @@ void dgpu_trial_run() {
                 else p->dgpu_direct = false;
             }
             p->dgpu_trial = false;
-            dgpu_keep_add(lo, dir > 0 ? 'D' : 'M');
+            if (dgpu_variant_clear(dgpu_trial.after_ms, dgpu_trial.base_ms))   // (the base state was the clear one)
+                dgpu_keep_add(lo, dir > 0 ? 'D' : 'M');
             st_dgpu_kept++;
             dgpu_trial = {};
             break;

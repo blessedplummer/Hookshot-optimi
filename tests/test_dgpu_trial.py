@@ -163,8 +163,15 @@ int main() {
         }
         CHECK(t.phase == 1);
     }
+    // (the keep FILE's test: only a clear winner (10% and 0.05 ms either way) outlives the run - the uncapped
+    // first cut wrote 32 verdicts from noisy gameplay windows)
+    CHECK(dgpu_variant_clear(10.0, 8.5));    // (15% faster: clear)
+    CHECK(!dgpu_variant_clear(10.0, 9.5));   // (5%: an in-run keep at best, not a file verdict)
+    CHECK(!dgpu_variant_clear(10.0, 9.9));   // (1% and 0.1 ms: noise)
+    CHECK(!dgpu_variant_clear(8.5, 10.0));   // (slower is never clear; KEEP_BASE reads it with the sides swapped)
+    CHECK(!dgpu_variant_clear(0.0, 0.0));    // (a zero window proves nothing)
     std::puts("PASS: the trial gates on GPU time and loads, keeps flips only past the measured margins, "
-        "confirms a failed window against the base state, and writes nothing on noise");
+        "confirms a failed window against the base state, and writes only clear winners to the keep file");
 }
 '''
     with tempfile.TemporaryDirectory(prefix="dgpu-trial-") as tmp:

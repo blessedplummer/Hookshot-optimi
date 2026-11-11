@@ -87,6 +87,16 @@ def check_source():
     adder = block(mem, "void dgpu_keep_add(uint64_t lo, char v) {")
     if 'fopen(dgpu_keep_path().c_str(), "a")' not in adder or "%c %llx" not in adder:
         raise SystemExit("verdicts must be appended in the keep file's line format")
+    # (trial discipline: a few trials a run, and only a clear winner reaches the file that outlives the run -
+    # the uncapped first cut ran 57 trials and wrote 32 untrusted verdicts from noisy gameplay windows)
+    run = mem[mem.index("void dgpu_trial_run() {"):]
+    run = run[:run.index("\n}") + 2]
+    if "st_dgpu_trials >= kDtTrialMax" not in run:
+        raise SystemExit("the trial must be capped per run")
+    if run.count("dgpu_variant_clear(") != 2:
+        raise SystemExit("both keep-file writes must pass the clear-winner test")
+    if "kDtKeepPct = 0.10" not in mem:
+        raise SystemExit("the keep file's clear margin is missing")
     # (the trial's windows and gates are constants, not magic numbers buried in the steps)
     for const in ("kDtGpuLimitMs = 6.0", "kDtPromotePct = 0.03", "kDtDemoteSlackPct = 0.20", "kDtDemoteClear = 1.5"):
         if const not in mem:
