@@ -281,8 +281,6 @@ VkQueryPool ts_pool = VK_NULL_HANDLE;
 bool ts_pending[kRecordings];
 int64_t st_gpu_max_ns;
 std::atomic<int64_t> st_gpu_ns;   // (dGPU policy: the mirror trial reads it from the recording thread too)
-/// (dGPU policy) The GPU time recorded so far (vk_internal.h): the trial's per-window deltas
-int64_t gpu_time_total_ns() { return st_gpu_ns.load(std::memory_order_relaxed); }
 void gpu_time_collect(Recording& r) {
     if (!ts_pool || !ts_pending[r.slot]) return;
     ts_pending[r.slot] = false;
@@ -532,6 +530,10 @@ void ub_prune(uint64_t done) {
 }
 
 } // namespace
+
+/// (dGPU policy) The GPU time recorded so far, in nanoseconds (vk_internal.h): the mirror trial's per-window
+/// deltas. Defined at mkwvk scope, past the anonymous namespace st_gpu_ns lives in
+int64_t gpu_time_total_ns() { return st_gpu_ns.load(std::memory_order_relaxed); }
 
 uint64_t ub_generation() {
     return ub_gen;
