@@ -295,6 +295,8 @@ int64_t st_wait_ns;   // (time the replay waited for a recording slot: the GPU b
 VkQueryPool ts_pool = VK_NULL_HANDLE;
 bool ts_pending[kRecordings];
 int64_t st_gpu_ns, st_gpu_max_ns;
+int64_t gpu_ns_total = 0;   // (gpu_time_total_ns: never reset, unlike st_gpu_ns above)
+int64_t gpu_time_total_ns() { return gpu_ns_total; }
 void gpu_time_collect(Recording& r) {
     if (!ts_pool || !ts_pending[r.slot]) return;
     ts_pending[r.slot] = false;
@@ -304,6 +306,7 @@ void gpu_time_collect(Recording& r) {
     if (t[1] <= t[0]) return;
     const int64_t ns = (int64_t)((t[1] - t[0]) * (double)dev.props.limits.timestampPeriod);
     st_gpu_ns += ns;
+    gpu_ns_total += ns;
     st_gpu_max_ns = std::max(st_gpu_max_ns, ns);
 }
 }   // namespace

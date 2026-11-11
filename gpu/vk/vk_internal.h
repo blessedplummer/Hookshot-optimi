@@ -245,6 +245,10 @@ bool ub_read(uint64_t addr, void* dst, uint64_t n);
 /// [guest, guest + n) as of the submit being replayed: live itself, or scratch holding it with the kept pages over it
 const uint8_t* memory_as_submitted(uint64_t guest, const uint8_t* live, uint64_t n, std::vector<uint8_t>& scratch);
 void memory_drop_shadow(uint64_t guest, uint64_t size);   // (a write the capture did not take: the copies go)
+/// (vk_replay.cpp) the GPU time the recordings collected so far, in ns, never reset: the dGPU policy's trials
+/// (vk_memory.cpp dgpu_trials) measure a pool in guest memory against its mirror from it. st_gpu_ns itself is reset
+/// by the 120-frame status line; the trials' deltas must not see that
+int64_t gpu_time_total_ns();
 /// (EvilBoyce) the newest submission value whose write-back reaches into [guest, guest + size) (0: none ever); *ever set
 /// when any write-back ever did
 uint64_t memory_writeback_value(uint64_t guest, uint64_t size, bool* ever);

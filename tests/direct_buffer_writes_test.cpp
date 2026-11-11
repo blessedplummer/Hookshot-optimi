@@ -62,6 +62,12 @@ struct Host { const uint8_t* (*gpu_ptr)(uint64_t, uint64_t*); uint64_t (*gpu_gue
 static Host interface{gpu_ptr, gpu_guest};
 static Host* host = &interface;
 
+// (RX_VK_DGPU: off in the stock cases, real in dgpu_default - the policy's state the binding path reads)
+#include "../gpu/vk/dgpu_policy.h"
+static bool dgpu_state = false;
+static bool dgpu_on() { return dgpu_state; }
+static dgpu::Trial dgpu_trial;
+
 #include "direct_write_actual.inc"
 
 static void readback_disabled(bool off) {
@@ -105,6 +111,7 @@ int main(int argc, char** argv) {
         else if (mode == "refused") pool.mstate = Pool::MIRROR_REFUSED, size = 1u << 20;
         else if (mode == "mirror_pending") pool.mstate = Pool::MIRROR_WANTED;
         else if (mode == "mirror_on") pool.mstate = Pool::MIRROR_ON;
+        else if (mode == "dgpu_default") dgpu_state = true;   // (no mirror made, none queued: the policy's default)
         else if (mode == "invalid_pool") have_pool = false;
         else if (mode == "invalid_mapping") mapping_valid = false, gpu = virtual_base + 4092;
         else throw std::runtime_error("unknown fixture case");
@@ -129,6 +136,12 @@ int main(int argc, char** argv) {
                         writebacks[0].lo == ref.offset && writebacks[0].hi == ref.offset + size &&
                         !pool.direct_write_epoch && synced == 1, "changed mirrored writeback behavior");
                 page_state(guest, size, false);
+            } else if (mode == "dgpu_default") {
+                // (the policy's first binding: in guest memory and marked refused, so the later read binds take the
+                // lock-free path and nothing is queued for the mirrors)
+                require(pool.mstate == Pool::MIRROR_REFUSED && mirror_wanted.empty() && writebacks.empty() && !synced,
+                        "the dGPU policy's first binding did not stay in guest memory");
+                page_state(guest, size, true);
             } else if (mode == "readonly") {
                 require(!pool.direct_write_epoch && !texture_writes && writebacks.empty(), "readonly binding recorded a write");
                 page_state(guest, size, false);
@@ -147,7 +160,8 @@ int main(int argc, char** argv) {
         require(texture_writes == (written ? 1u : 0u), "changed existing texture write notification");
         require(!st_async_copies, "unexpected asynchronous streaming copy");
         require(!made, "unexpected mirror allocation attempt");
-        const bool forgot = written && have_pool && mapping_valid && (!mirrors || !mirror_upload || mode == "refused");
+        const bool forgot = written && have_pool && mapping_valid &&
+                            (!mirrors || !mirror_upload || mode == "refused" || mode == "dgpu_default");
         const uint64_t off = guest - pool.lo, span = std::min(size, pool.hi - guest);
         for (uint64_t pg = 0; pg < pages; pg++) {
             const bool covered = forgot && span && pg >= (off >> kPageShift) && pg <= ((off + span - 1) >> kPageShift);
