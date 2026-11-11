@@ -123,6 +123,18 @@ inline bool trial_candidate(uint64_t read_bytes, uint64_t wrote_bytes) {
     return read_bytes >= (1ull << 20) && wrote_bytes < read_bytes;
 }
 
+// The A/B's validity, checked at the verdict: the two windows must have measured the same scene and the same
+// workload on it. The scene moved when the set of pools the windows bound is not the same (a working mirror
+// changes where a pool's reads are served from, not which pools bind - the caller counts binds on every serving
+// path, the mirror's included, so its service cannot read as drift); the workload moved when the trial pool's own
+// bind count moved over two times either way (a menu, a LOD switch, a load). Either one voids the A/B: no verdict,
+// no skip line, and the caller counts such endings against a cap. What must never void it: the mirror serving the
+// pool's reads, which collapses the guest-memory-served binds (~70x measured) while the scene and the workload
+// stand still - that is the mirror working, and the caller's per-path counting keeps it out of these numbers.
+inline bool ab_voided(uint64_t base_binds, uint64_t binds, size_t scene_moved) {
+    return scene_moved > 0 || binds > 2 * base_binds || 2 * binds < base_binds;
+}
+
 // A skip-list line: one hex pool start, one a line, as Triforce's keep list keeps them; anything from '#' on is a
 // note. False for a blank or commented line, so the reader skips it without stopping. A leading '-' is refused
 // (strtoull would take "-1a2b" as a wrap-around number), and the line must END at the number: "1a2bxyz" would

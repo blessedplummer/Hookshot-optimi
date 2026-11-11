@@ -59,6 +59,19 @@ int main() {
     CHECK(!trial_candidate(2'000'000, 2'000'000));    // (wrote at least what it read: render target)
     CHECK(!trial_candidate(2'000'000, 3'000'000));
 
+    // ---- the A/B's validity: the scene's pool set and the trial pool's own bind volume, counted on every serving
+    // path (the mirror's included) - so the mirror working can never read as the workload moving ----
+    CHECK(!ab_voided(12420, 12420, 0));   // (the measured scene, honestly counted: the mirror serves the reads and
+                                          //   the binds continue - the old check read the same scene's collapse,
+                                          //   12420 -> 180 of guest-served binds, as drift and voided 40+ trials
+                                          //   a run; the caller now counts the mirror's binds, so the collapse
+                                          //   never reaches this function)
+    CHECK(!ab_voided(1000, 1900, 0));     // (1.9x: under the line)
+    CHECK(ab_voided(1000, 2500, 0));      // (2.5x the binds: a menu or a LOD switch moved the workload)
+    CHECK(ab_voided(1000, 300, 0));       // (honestly 3x down: the workload moved, void even with the same pools)
+    CHECK(ab_voided(1000, 1000, 1));      // (one pool entered or left the scene: a scene change voids at any volume)
+    CHECK(!ab_voided(16, 16, 0));
+
     // ---- a skip-list line: one hex start, one a line, '#' a note; a '-' start or trailing junk is refused ----
     uint64_t lo = 0;
     CHECK(keep_line("1a2b3c4d\n", lo) && lo == 0x1a2b3c4dull);

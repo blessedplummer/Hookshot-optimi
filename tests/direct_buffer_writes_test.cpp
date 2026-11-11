@@ -66,7 +66,6 @@ static Host* host = &interface;
 #include "../gpu/vk/dgpu_policy.h"
 static bool dgpu_state = false;
 static bool dgpu_on() { return dgpu_state; }
-static dgpu::Trial dgpu_trial;
 
 #include "direct_write_actual.inc"
 

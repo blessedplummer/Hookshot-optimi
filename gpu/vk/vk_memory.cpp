@@ -94,7 +94,11 @@ struct Pool {
     bool dgpu_mirror = false;   // its trial won: mirrored from its next binding
     bool dgpu_done = false;     // its trial is over or running: never another
     uint32_t dgpu_aborts = 0;   // trials given up without a verdict (a mirror that never came on): 3 and it sits out the session
-    uint64_t dgpu_binds = 0;    // bindings since the trial's last phase change (a pool nothing binds measures nothing)
+    uint64_t dgpu_binds = 0;    // binds of this pool. The trial pool's is the trial's own: reset at its phase
+                                // changes and compared before/after (dgpu::ab_voided's drift check) - counted on
+                                // every serving path, the mirror's included, so the mirror working cannot read as
+                                // the workload moving. Every other pool's counts the trailing 600-submit window
+                                // (reset with it): the scene set reads them (dgpu_scene below)
     uint64_t dgpu_wrote = 0;    // bytes the GPU wrote in guest memory this 600-submits window (a write-dominated pool is no candidate)
     uint64_t dgpu_read = 0;     // bytes the GPU read in guest memory this 600-submits window: the promoter's evidence.
                                 // Per pool (not in a shared map): the read binds are counted on the lock-free fast
@@ -2791,6 +2795,14 @@ void dgpu_skip_add(uint64_t lo) {
 // to A/B the trials apart from the policy).
 int64_t st_dgpu_trials = 0, st_dgpu_promoted = 0, st_dgpu_released = 0;
 dgpu::Trial dgpu_trial;
+// (the trial's scene: the pools the Base window bound meaningfully, snapshotted when the mirror phase begins and
+// compared with the trailing window's set at the verdict - dgpu::ab_voided. A working mirror does not touch it: the
+// pools that bind still bind, whatever serves their reads. A scene change swaps pools in and out of it)
+std::vector<uint64_t> dgpu_scene;
+// a pool is part of the scene from 64 binds of a trailing ~600-submit window (some 2 s): a pool the scene really
+// uses binds hundreds to thousands of times, and a marginal pool that straddles a lower line would flicker in and
+// out of the set across windows and void trials that measured the same scene (seen at the title screen at 16)
+constexpr uint64_t kSceneBinds = 64;
 double dgpu_gain_pct() {
     // (a number, not an on/off switch: env_int's rule in double form; unset, empty or not a number: the default)
     static const double v = getenv("RX_VK_DGPU_GAIN") && *getenv("RX_VK_DGPU_GAIN") ? atof(getenv("RX_VK_DGPU_GAIN")) : 10.0;
@@ -2855,13 +2867,18 @@ BufferRef gpu_buffer_bind(uint64_t gpu, uint64_t size, bool written) {
             // feature - the policy runs trial-less, pure direct)
             if (dgpu_on() && !par) {
                 p->dgpu_read += size;
-                if (dgpu_trial.lo == p->lo) p->dgpu_binds++;
+                p->dgpu_binds++;   // (every pool's binds, not just the trial's: the scene set reads the rest)
             }
             // (in a recording, this binding is guest memory the GPU reads at execute: the #1795 class)
             return remember({p->buffer, off, size, 0, mirror_upload});
         }
-        if (p->mstate == Pool::MIRROR_ON && p->synced_epoch == mirror_epoch && p->sync_seg <= texture_segment())
+        if (p->mstate == Pool::MIRROR_ON && p->synced_epoch == mirror_epoch && p->sync_seg <= texture_segment()) {
+            // (a mirror-served bind is still the game binding the pool: counted, or the trial's drift check would
+            // read the mirror doing its job - the guest-served binds collapsing ~70x - as the workload moving,
+            // void every trial the mirror would win, and never converge)
+            if (dgpu_on() && !par) p->dgpu_binds++;
             return remember({p->mirror, off, size, 0});
+        }
     }
     ParLock plk;   // (before pools_mu, always: a mirror sync records into the shared upload command buffer)
     std::lock_guard lk(pools_mu);
@@ -2889,6 +2906,7 @@ BufferRef gpu_buffer_bind(uint64_t gpu, uint64_t size, bool written) {
         // (RX_VK_DGPU) a written bind always takes this locked path, so the window's reads would miss its read
         // binds' bytes if they only counted on the fast path; the pool's own field takes them from both sides
         if (dgpu_on() && !written) p->dgpu_read += size;
+        if (dgpu_on()) p->dgpu_binds++;   // (written binds count too: the scene set and the drift check read them)
         // (hookshot) written by the GPU in guest memory itself, past the mirror (bound outside a recording's uploads): the
         // write-back diff's shadow no longer knows those pages, and reads them again at its next write-back, after this write
         if (written) shadow_forget(*p, off, std::min(size, p->hi - p->lo - off));
@@ -2903,8 +2921,6 @@ BufferRef gpu_buffer_bind(uint64_t gpu, uint64_t size, bool written) {
     // before it found the mirror in the page table and read it unfilled (houses, rocks and bushes missing, geometry
     // torn, the more the segments the worse; #994 with RX_VK_PARALLEL). RX_VK_MIRROR_DEFER=1: at the next submission, as before)
     static const bool defer = env_on("RX_VK_MIRROR_DEFER");
-    if (dgpu_on() && dgpu_trial.lo == p->lo) p->dgpu_binds++;   // (the trial's pool: its binds across a window say its
-                                                               //   mirror was measured on work, not on idle)
     // (RX_VK_DGPU: a pool no trial has won makes no mirror here and queues none - its first binding marks it
     // MIRROR_REFUSED, every later read bind takes the lock-free fast path above, and its writes land in guest
     // memory itself (note_direct_write), coherent by the import. Only a trial-won pool (dgpu_mirror) comes here
@@ -2933,6 +2949,7 @@ BufferRef gpu_buffer_bind(uint64_t gpu, uint64_t size, bool written) {
         direct_bytes_by_pool[p->lo] += size;
         if (written) note_direct_write(*p, off, size);
         else if (dgpu_on()) p->dgpu_read += size;   // (the window's reads, on both direct paths: see the fast path)
+        if (dgpu_on()) p->dgpu_binds++;   // (see the fast path: every pool's binds, once per bind, at its serving path)
         return remember({p->buffer, off, size, 0, mirror_upload});
     }
     if (p->synced_epoch != mirror_epoch || p->sync_seg > texture_segment()) mirror_sync(*p);
@@ -2952,6 +2969,10 @@ BufferRef gpu_buffer_bind(uint64_t gpu, uint64_t size, bool written) {
             writebacks.push_back({p, off, std::min(off + size, p->hi - p->lo)});
         rb_hazard_locked(p->lo + off, p->lo + std::min(off + size, p->hi - p->lo));   // (memory_rb_refresh)
     }
+    if (dgpu_on()) p->dgpu_binds++;   // (a mirror-served bind is still the game binding the pool: counted, or the
+                                      //   trial's drift check would read the mirror doing its job - the guest-served
+                                      //   binds collapsing ~70x - as the workload moving, and void every trial the
+                                      //   mirror would win. Under the lock, so no par gate)
     return remember({p->mirror, off, size, 0});
 }
 
@@ -3627,6 +3648,12 @@ void dgpu_trials() {
                                  // and a copy recorded here would land behind the submission that closes this one)
         p->mstate = Pool::MIRROR_NONE;   // (out of the policy's refused state, or the make at its binding is never reached)
         dgpu_trial.base_binds = p->dgpu_binds;   // (the after window's bind volume is compared with it at the verdict)
+        // (the scene's snapshot: every other pool the trailing window bound meaningfully - the trial pool is the
+        // volume guard's subject, not a set member. Compared at the verdict: a scene change swaps pools in and out
+        // of the set; a working mirror leaves it alone, whatever it now serves)
+        dgpu_scene.clear();
+        for (const auto& [slo, sp] : imported)
+            if (slo != dgpu_trial.lo && sp.dgpu_binds >= kSceneBinds) dgpu_scene.push_back(slo);
         logf("vk: dGPU trial %#llx (%llu MB): %.2f ms a frame in guest memory; its mirror made at its next binding",
              (unsigned long long)p->lo, (unsigned long long)((p->hi - p->lo) >> 20), dgpu_trial.direct_ms);
         break;
@@ -3636,19 +3663,39 @@ void dgpu_trials() {
         const double direct = dgpu_trial.direct_ms, mirrored = dgpu_trial.mirror_ms;
         dgpu_trial.stop();
         if (!p) break;   // (retired while measured: no verdict to keep)
-        // (the two windows must have measured the same workload: a scene change, a menu or a LOD switch can
-        // double a pool's bind rate or halve it between the windows, and the A/B then says nothing about the
-        // mirror. Release the mirror, no verdict, no skip line: the pool is free to trial again)
-        if (dgpu_trial.base_binds &&
-            (p->dgpu_binds > 2 * dgpu_trial.base_binds || 2 * p->dgpu_binds < dgpu_trial.base_binds)) {
+        // (the two windows must have measured the same scene and the same workload on it: the pools the windows
+        // bound are compared as a set - a scene change swaps them, a working mirror does not, whatever it now
+        // serves - and the trial pool's own bind count, counted on every path, must sit within two times of the
+        // before window's (a menu, a LOD switch). Either one voids the A/B: release the mirror, no verdict, no
+        // skip line. What this must never read as drift is the mirror serving the pool's reads - that collapse
+        // (12420 before, 180 after, measured) was the old check voiding every trial the mirror would win, 40+
+        // a run, forever. Three no-verdict endings, voids and settle give-ups together, and the pool sits out the
+        // session: the churn must not repeat even where detection is imperfect)
+        size_t scene_moved = 0, scene_new = 0;
+        for (uint64_t slo : dgpu_scene) {
+            const Pool* sp = dgpu_pool_at(slo);
+            if (!sp || sp->dgpu_binds < kSceneBinds) scene_moved++;   // (out of the set: retired, or gone quiet)
+        }
+        for (const auto& [slo, sp] : imported)
+            if (slo != dgpu_trial.lo && sp.dgpu_binds >= kSceneBinds &&
+                std::find(dgpu_scene.begin(), dgpu_scene.end(), slo) == dgpu_scene.end())
+                scene_new++;   // (new in the set)
+        if (dgpu_trial.base_binds && dgpu::ab_voided(dgpu_trial.base_binds, p->dgpu_binds, scene_moved + scene_new)) {
             if (p->mstate == Pool::MIRROR_ON) mirror_free(*p);
             const auto wanted = std::find(mirror_wanted.begin(), mirror_wanted.end(), p);
             if (wanted != mirror_wanted.end()) mirror_wanted.erase(wanted);
             p->mstate = Pool::MIRROR_REFUSED;
             p->dgpu_mirror = false;
-            logf("vk: dGPU trial %#llx (%llu MB): the windows' bind volume moved (%lld before, %lld after) - the A/B is "
-                 "void, no verdict, tried again later", (unsigned long long)p->lo, (unsigned long long)((p->hi - p->lo) >> 20),
-                 (long long)dgpu_trial.base_binds, (long long)p->dgpu_binds);
+            if (++p->dgpu_aborts >= 3) {
+                p->dgpu_done = true;
+                logf("vk: dGPU trial %#llx (%llu MB): no verdict %u times (voids and give-ups together) - no more "
+                     "trials for it this session", (unsigned long long)p->lo,
+                     (unsigned long long)((p->hi - p->lo) >> 20), p->dgpu_aborts);
+            } else
+                logf("vk: dGPU trial %#llx (%llu MB): the A/B's windows moved apart (%lld before, %lld after binds; "
+                     "%zu pools left the scene, %zu entered) - void, no verdict, tried again later",
+                     (unsigned long long)p->lo, (unsigned long long)((p->hi - p->lo) >> 20),
+                     (long long)dgpu_trial.base_binds, (long long)p->dgpu_binds, scene_moved, scene_new);
             break;
         }
         p->dgpu_done = true;
@@ -3680,8 +3727,9 @@ void dgpu_trials() {
     case dgpu::Act::Abort: {
         // (the mirror never came on within the wait: the budget full, mostly. No verdict - but the same heaviest
         // pool would otherwise start a trial every window and give it up 132 frames later, logging each time, for
-        // the session. Three give-ups and the pool sits out for the session: the skip list is for verdicts, this
-        // is for trials that cannot run. A mirror that frees later does not revive it - the next run does)
+        // the session. Three no-verdict endings - these give-ups and the verdict's voids share the count - and the
+        // pool sits out for the session: the skip list is for verdicts, this is for trials that cannot run. A
+        // mirror that frees later does not revive it - the next run does)
         Pool* p = dgpu_pool_at(dgpu_trial.lo);
         if (p) {
             const auto wanted = std::find(mirror_wanted.begin(), mirror_wanted.end(), p);
@@ -3690,8 +3738,8 @@ void dgpu_trials() {
             p->dgpu_mirror = false;
             if (++p->dgpu_aborts >= 3) {
                 p->dgpu_done = true;
-                logf("vk: dGPU trial %#llx (%llu MB): its mirror never came on %u times (the mirror budget?) - no more "
-                     "trials for it this session", (unsigned long long)p->lo,
+                logf("vk: dGPU trial %#llx (%llu MB): no verdict %u times (the mirror never came on, or the windows "
+                     "moved apart) - no more trials for it this session", (unsigned long long)p->lo,
                      (unsigned long long)((p->hi - p->lo) >> 20), p->dgpu_aborts);
             } else
                 logf("vk: dGPU trial %#llx (%llu MB): its mirror never came on in the settle - no verdict, tried again later",
@@ -3930,7 +3978,12 @@ void memory_end_submission(VkCommandBuffer cmd) {
             }
             if (dgpu_on()) {
                 dgpu_pick();   // (this window's reads are the candidates' evidence: picked before they are dropped)
-                for (auto& [lo, p] : imported) { p.dgpu_read = 0; p.dgpu_wrote = 0; }   // (the next window's)
+                for (auto& [lo, p] : imported) {
+                    p.dgpu_read = 0; p.dgpu_wrote = 0;   // (the next window's)
+                    if (dgpu_trial.lo != lo) p.dgpu_binds = 0;   // (the scene set's: the trailing window's binds.
+                                                                 //   The trial pool's is the trial's own - it is
+                                                                 //   reset at its phase changes, never under it)
+                }
                 logf("vk: dGPU (600 submits): %lld trials so far (%lld kept mirrored, %lld released); %llu MB of mirrors now",
                      (long long)st_dgpu_trials, (long long)st_dgpu_promoted, (long long)st_dgpu_released,
                      (unsigned long long)(mirror_bytes >> 20));

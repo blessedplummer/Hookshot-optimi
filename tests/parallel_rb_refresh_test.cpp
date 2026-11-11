@@ -82,6 +82,9 @@ void mirror_sync(Pool& p) {   // (model: no CPU page is dirty here)
     p.synced_epoch = mirror_epoch;
     p.sync_seg = texture_segment();
 }
+// (RX_VK_DGPU: off - the fixture models the stock parallel refresh. The policy's bind counting in the cut compiles
+// against this and the Pool field, and reads nothing else)
+static bool dgpu_on() { return false; }
 #include "rb_refresh.inc"
 
 /// gpu_buffer_bind: the pool's mirror when it has one (model of its front), then its actual last lines

@@ -2,10 +2,12 @@
 still wires them the way the policy states them: RX_VK_DGPU gates the whole policy (a pool's first binding makes no
 mirror under it and marks it refused - in guest memory, nothing synced; unset, the policy costs nothing, not even its
 counters), the refused pools' uniform buffers are copied as submitted (issue 1795's in-place hazard), the promotion
-trials run one at a time on the frame's present-to-present time, a verdict keeps a mirror only when the trial measured
-it faster by the percent and the floor (whichever asks more), a loss is added to hookshot_mirror_skip.txt beside the
-game's own files under a header naming the device and driver, and a candidate needs reads above the noise, not
-write-dominated, a mirror that can come on, and a serial replay.
+trials run one at a time on the frame's present-to-present time with binds counted on every serving path (the
+mirror's included, so its work cannot read as drift), the A/B is voided only by a real scene or workload move and
+three no-verdict endings sit a pool out, a verdict keeps a mirror only when the trial measured it faster by the
+percent and the floor (whichever asks more), a loss is added to hookshot_mirror_skip.txt beside the game's own files
+under a header naming the device and driver, and a candidate needs reads above the noise, not write-dominated, a
+mirror that can come on, and a serial replay.
 
 python -I -B tests/test_dgpu_policy.py [--cxx g++]
 """
@@ -58,14 +60,19 @@ def check_source():
           "(!dgpu_on() || p->dgpu_mirror) && !par && mirror_make(*p)",
           "if (dgpu_on() && !p->dgpu_mirror) {   // (the policy's default: in guest memory until a trial says otherwise)",
           "p->mstate = Pool::MIRROR_REFUSED;",
-          "if (dgpu_on() && dgpu_trial.lo == p->lo) p->dgpu_binds++;",
           # (the lock-free fast path counts the window's guest-memory bytes too, under the switch, in the pool's own
           # field - unset, this path is an iGPU run's main read path and would pay a shared-map touch per bind for
           # nothing. Under a parallel replay neither counter runs: the fast path is lock-free there and the counters
           # are the trials' fodder, and the trials are a serial-replay feature - no data race, and nothing to count
           "if (dgpu_on() && !par) {",
           "p->dgpu_read += size;",
-          "if (dgpu_trial.lo == p->lo) p->dgpu_binds++;"])
+          "p->dgpu_binds++;   // (every pool's binds, not just the trial's: the scene set reads the rest)",
+          # (a mirror-served bind is counted too, on every serving path: the drift check must never read the mirror
+          # doing its job - the guest-served binds collapsing ~70x, measured - as the workload moving)
+          "if (dgpu_on() && !par) p->dgpu_binds++;",
+          "a mirror-served bind is still the game binding the pool: counted,",
+          "if (dgpu_on()) p->dgpu_binds++;   // (written binds count too: the scene set and the drift check read them)",
+          "once per bind, at its serving path"])
     need("vk_memory.cpp: the locked direct path", bind,
          ["if (dgpu_on() && !written) p->dgpu_read += size;",
           "else if (dgpu_on()) p->dgpu_read += size;"])
@@ -97,8 +104,17 @@ def check_source():
           "if (++p->dgpu_aborts >= 3) {",
           "p->dgpu_done = true;",
           "dgpu_trial.base_binds = p->dgpu_binds;",
-          # (the two windows must have measured the same workload: over 2x either way voids the A/B, no verdict)
-          "p->dgpu_binds > 2 * dgpu_trial.base_binds || 2 * p->dgpu_binds < dgpu_trial.base_binds",
+          # (the scene's snapshot at the mirror phase: the other pools the trailing window bound meaningfully -
+          # compared as a set at the verdict, a scene change swaps them, a working mirror does not)
+          "dgpu_scene.clear();",
+          "sp.dgpu_binds >= kSceneBinds",
+          # (the two windows must have measured the same scene and workload: the set moved, or the trial pool's own
+          # bind count - counted on every path, the mirror's included - moved over 2x either way. The volume alone,
+          # guest-served, was the old check's livelock: it voided every trial the mirror would win)
+          "dgpu::ab_voided(dgpu_trial.base_binds, p->dgpu_binds, scene_moved + scene_new)",
+          "size_t scene_moved = 0, scene_new = 0;",
+          # (three no-verdict endings - voids and settle give-ups share the count - and the pool sits out the session)
+          "++p->dgpu_aborts >= 3",
           # (the settle-turned-measure counts the after window's binds from zero)
           "tp->dgpu_binds = 0;"])
     # (the candidate: this window's heaviest pool in guest-memory bytes, from the pools' own fields (not a shared
@@ -116,7 +132,10 @@ def check_source():
           "dgpu_trial.start(best->lo, texture_frame_no(), present_time_total_ns())"])
     stats = block(mem, "void memory_end_submission(")
     need("vk_memory.cpp: memory_end_submission()", stats,
-         ["if (dgpu_on()) {", "dgpu_pick();", "p.dgpu_read = 0; p.dgpu_wrote = 0;", "if (dgpu_on()) dgpu_trials();"])
+         ["if (dgpu_on()) {", "dgpu_pick();", "p.dgpu_read = 0; p.dgpu_wrote = 0;", "if (dgpu_on()) dgpu_trials();",
+          # (the scene set's counters are the trailing window's; the trial pool's is phase-owned and never reset
+          # under a trial)
+          "if (dgpu_trial.lo != lo) p.dgpu_binds = 0;"])
     # (the frame time the trials read: present-to-present, one clock read a present, never reset - the 120-frame
     # status line resets st_gpu_ns, the trials' deltas must not see that; the GPU-only total is gone, its verdict
     # kept mirrors while the frame was CPU-bound)
