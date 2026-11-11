@@ -31,6 +31,7 @@ enum class Act : uint8_t {
     None,     // the phase runs on
     Mirror,   // the before is measured: give the pool its mirror now
     Decide,   // the after is measured: compare with mirror_worth and keep the mirror or release it
+    Abort,    // the mirror never came on for the settle to wait out: no verdict, the pool is free to trial again
 };
 
 struct Trial {
@@ -41,15 +42,20 @@ struct Trial {
     int64_t g0 = 0;           // the GPU time total when it began
     double direct_ms = 0;     // the GPU's ms a frame with the pool in guest memory
     double mirror_ms = 0;     // the same with its mirror
+    uint64_t base_binds = 0;  // the pool's binds the before window gathered (the after window's are compared with it)
 
     // The windows, in frames. 120 is some 3.5 s at 35 fps - long enough that a momentary stall in one does not
     // decide; 12 of settle covers the make's copy (a pool of a few hundred MB copies in a few ms of GPU time) and
-    // the first frames' pipeline warm-up. Triforce measured with 10 and 90; the wider windows cost a few seconds
-    // per trial and buy a verdict that holds.
+    // the first frames' pipeline warm-up - but the settle may not START until the mirror is really on: its make
+    // happens at the pool's next binding, which a slow or idle pool may not deliver for a while, and measuring
+    // with a half-made mirror reads the make's own copy as the pool's cost. The caller passes whether the pool's
+    // mirror is bound now; Settle holds until it is, and gives up after a whole window of waiting (the caller
+    // releases such a trial without a verdict, so the pool can be trialed later). Triforce measured with 10 and
+    // 90; the wider windows cost a few seconds per trial and buy a verdict that holds.
     static constexpr uint32_t kSettle = 12, kWindow = 120;
 
     void start(uint64_t pool_lo, uint64_t frame, int64_t gpu_ns) {
-        lo = pool_lo, phase = Base, f0 = frame, g0 = gpu_ns, direct_ms = 0, mirror_ms = 0;
+        lo = pool_lo, phase = Base, f0 = frame, g0 = gpu_ns, direct_ms = 0, mirror_ms = 0, base_binds = 0;
     }
     void stop() { phase = Idle, lo = 0; }
 
@@ -58,16 +64,27 @@ struct Trial {
         return frame > f0 ? (double)(gpu_ns - g0) / (double)(frame - f0) / 1e6 : 0.0;
     }
 
-    Act step(uint64_t frame, int64_t gpu_ns) {
+    Act step(uint64_t frame, int64_t gpu_ns, bool mirror_ready = true) {
         if (phase == Idle) return Act::None;
         if (phase == Base && frame >= f0 + kWindow) {
             direct_ms = ms(frame, gpu_ns);
             phase = Settle, f0 = frame, g0 = gpu_ns;
             return Act::Mirror;
         }
-        if (phase == Settle && frame >= f0 + kSettle) {
-            phase = Measure, f0 = frame, g0 = gpu_ns;
-            return Act::None;
+        if (phase == Settle) {
+            // (the make is recorded at the pool's next binding, which may be slow to come: hold here until it is
+            // on, and give up - no verdict, the caller releases without one - after a window of waiting)
+            if (!mirror_ready) {
+                if (frame >= f0 + kSettle + kWindow) {
+                    stop();
+                    return Act::Abort;
+                }
+                return Act::None;
+            }
+            if (frame >= f0 + kSettle) {
+                phase = Measure, f0 = frame, g0 = gpu_ns;
+                return Act::None;
+            }
         }
         if (phase == Measure && frame >= f0 + kWindow) {
             mirror_ms = ms(frame, gpu_ns);
@@ -103,13 +120,17 @@ inline bool trial_candidate(uint64_t read_bytes, uint64_t wrote_bytes) {
 }
 
 // A skip-list line: one hex pool start, one a line, as Triforce's keep list keeps them; anything from '#' on is a
-// note. False for a blank or commented line, so the reader skips it without stopping.
+// note. False for a blank or commented line, so the reader skips it without stopping. A leading '-' is refused
+// (strtoull would take "-1a2b" as a wrap-around number), and the line must END at the number: "1a2bxyz" would
+// otherwise file a pool that was never measured.
 inline bool keep_line(const char* s, uint64_t& lo) {
     while (*s == ' ' || *s == '\t' || *s == '\r') s++;
-    if (*s == '\0' || *s == '\n' || *s == '#') return false;
+    if (*s == '\0' || *s == '\n' || *s == '#' || *s == '-') return false;
     char* end = nullptr;
     const unsigned long long v = strtoull(s, &end, 16);
     if (end == s || v == 0) return false;
+    while (*end == ' ' || *end == '\t' || *end == '\r') end++;
+    if (*end != '\0' && *end != '\n' && *end != '#') return false;
     lo = (uint64_t)v;
     return true;
 }

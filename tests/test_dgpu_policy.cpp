@@ -21,12 +21,20 @@ int main() {
     // (over the window, 2.0 ms a frame of GPU time: 240e6 ns over 120 frames)
     CHECK(t.step(1000 + Trial::kWindow, 240'000'000ll) == Act::Mirror);
     CHECK(t.phase == P::Settle && t.direct_ms == 2.0);
-    // (the settle does not measure; it waits out the make and the first frames on the new addresses)
-    CHECK(t.step(1000 + Trial::kWindow + Trial::kSettle - 1, 0) == Act::None);
-    CHECK(t.step(1000 + Trial::kWindow + Trial::kSettle, 0) == Act::None);
+    // (the settle waits for the mirror to really be on: with the mirror not bound, it holds)
+    CHECK(t.step(1000 + Trial::kWindow + Trial::kSettle, 0, false) == Act::None);
+    CHECK(t.phase == P::Settle);
+    // (a whole window of waiting with the mirror still not bound: no verdict, the pool is free to trial again)
+    CHECK(t.step(1000 + Trial::kWindow + Trial::kSettle + Trial::kWindow, 0, false) == Act::Abort);
+    CHECK(t.phase == P::Idle);
+    // (a fresh trial: the mirror comes on in time, the settle turns into the measure once the make's copy is done)
+    t.start(0x4242ull, 1000, 0);
+    CHECK(t.step(1000 + Trial::kWindow, 240'000'000ll, false) == Act::Mirror);
+    CHECK(t.step(1000 + Trial::kWindow + Trial::kSettle - 1, 0, true) == Act::None);   // (still settling)
+    CHECK(t.step(1000 + Trial::kWindow + Trial::kSettle, 0, true) == Act::None);
     CHECK(t.phase == P::Measure);
     // (with the mirror, 1.0 ms a frame: 180e6 ns over the window)
-    CHECK(t.step(1000 + Trial::kWindow + Trial::kSettle + Trial::kWindow, 180'000'000ll) == Act::Decide);
+    CHECK(t.step(1000 + Trial::kWindow + Trial::kSettle + Trial::kWindow, 180'000'000ll, true) == Act::Decide);
     CHECK(t.phase == P::Idle);   // (the verdict is the caller's, the trial already idle)
     CHECK(t.mirror_ms == 1.5);   // (180e6 over 120 frames)
 
@@ -51,7 +59,7 @@ int main() {
     CHECK(!trial_candidate(2'000'000, 2'000'000));    // (wrote at least what it read: render target)
     CHECK(!trial_candidate(2'000'000, 3'000'000));
 
-    // ---- a skip-list line: one hex start, one a line, '#' a note ----
+    // ---- a skip-list line: one hex start, one a line, '#' a note; a '-' start or trailing junk is refused ----
     uint64_t lo = 0;
     CHECK(keep_line("1a2b3c4d\n", lo) && lo == 0x1a2b3c4dull);
     CHECK(keep_line("0xdeadbeef\n", lo) && lo == 0xdeadbeefull);   // (an 0x prefix reads the same)
@@ -62,6 +70,8 @@ int main() {
     CHECK(!keep_line("   \n", lo));
     CHECK(!keep_line("0\n", lo));                                  // (0 is no pool's start)
     CHECK(!keep_line("nothex\n", lo));
+    CHECK(!keep_line("-1a2b\n", lo));                              // (strtoull would read a wrap-around number)
+    CHECK(!keep_line("1a2bxyz\n", lo));                            // (the junk would file a pool that was never measured)
 
     // ---- a trial that started over records its own numbers cleanly ----
     t.start(0x42ull, 500, 1'000'000'000ll);

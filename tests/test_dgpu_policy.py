@@ -51,29 +51,47 @@ def check_source():
           "if (dgpu_on() && !p->dgpu_mirror) {   // (the policy's default: in guest memory until a trial says otherwise)",
           "p->mstate = Pool::MIRROR_REFUSED;",
           "if (dgpu_on() && dgpu_trial.lo == p->lo) p->dgpu_binds++;",
-          # (the lock-free fast path counts the window's guest-memory bytes too, under the switch: unset, this path
-          # is an iGPU run's main read path and would pay two map touches per bind for nothing)
-          "if (dgpu_on() && !par) direct_bytes_by_pool[p->lo] += size;"])
+          # (the lock-free fast path counts the window's guest-memory bytes too, under the switch, in the pool's own
+          # field - unset, this path is an iGPU run's main read path and would pay a shared-map touch per bind for
+          # nothing; a written bind takes the locked path, which counts its reads beside the writes)
+          "if (dgpu_on()) {",
+          "if (!par) p->dgpu_read += size;",
+          "if (dgpu_trial.lo == p->lo) p->dgpu_binds++;"])
+    need("vk_memory.cpp: the locked direct path", bind,
+         ["if (dgpu_on() && !written) p->dgpu_read += size;",
+          "else if (dgpu_on()) p->dgpu_read += size;"])
     # (the trials: one at a time, on the game's frames and the recordings' GPU time; the make happens at the pool's
     # next binding, where the uploads are open - a copy recorded at a submission's end would land behind it; serial
     # replay only, and a losing verdict also leaves the pool out of the wanted queue)
     trials = block(mem, "void dgpu_trials() {")
     need("vk_memory.cpp: dgpu_trials()", trials,
-         ["dgpu_trial.step(f, g)", "gpu_time_total_ns()", "p->mstate = Pool::MIRROR_NONE;",
+         ["gpu_time_total_ns()", "p->mstate = Pool::MIRROR_NONE;",
           "if (p->mstate == Pool::MIRROR_ON) mirror_free(*p);",
           "dgpu::mirror_worth(direct, mirrored, dgpu_gain_pct(), dgpu_floor_ms())",
           "const auto wanted = std::find(mirror_wanted.begin(), mirror_wanted.end(), p);",
-          "mirror_wanted.erase(wanted);"])
-    # (the candidate: this window's heaviest pool in guest-memory bytes, trial_candidate's floor and write check,
-    # not parallel, not decided; picked while the window's bytes still exist)
-    pick = block(mem, "void dgpu_pick(const std::unordered_map<uint64_t, uint64_t>& read_bytes) {")
+          "mirror_wanted.erase(wanted);",
+          # (the settle waits for the mirror to really be on; a whole window of waiting aborts without a verdict)
+          "dgpu_trial.step(f, g, tp && tp->mstate == Pool::MIRROR_ON)",
+          "case dgpu::Act::Abort:",
+          # (the before must have measured the pool at work: binds, and a baseline worth the floor)
+          "if (!p->dgpu_binds || dgpu_trial.direct_ms < dgpu_floor_ms())",
+          "dgpu_trial.base_binds = p->dgpu_binds;",
+          # (the two windows must have measured the same workload: over 2x either way voids the A/B, no verdict)
+          "p->dgpu_binds > 2 * dgpu_trial.base_binds || 2 * p->dgpu_binds < dgpu_trial.base_binds",
+          # (the settle-turned-measure counts the after window's binds from zero)
+          "tp->dgpu_binds = 0;"])
+    # (the candidate: this window's heaviest pool in guest-memory bytes, from the pools' own fields (not a shared
+    # map off the lock); trial_candidate's floor and write check; not parallel, not decided; picked while the
+    # window's bytes still exist)
+    pick = block(mem, "void dgpu_pick() {")
     need("vk_memory.cpp: dgpu_pick()", pick,
-         ["getenv(\"RX_VK_DGPU_TRIALS\")", "par_active.load(std::memory_order_relaxed)",
-          "dgpu_trial.phase != dgpu::Trial::Idle", "dgpu::trial_candidate(bytes, p->dgpu_wrote)",
-          "std::find(dgpu_skip().begin(), dgpu_skip().end(), lo)"])
+         ['getenv("RX_VK_DGPU_TRIALS") ? atoi(getenv("RX_VK_DGPU_TRIALS")) != 0 : true',
+          "par_active.load(std::memory_order_relaxed)",
+          "dgpu_trial.phase != dgpu::Trial::Idle", "dgpu::trial_candidate(p.dgpu_read, p.dgpu_wrote)",
+          "std::find(dgpu_skip().begin(), dgpu_skip().end(), lo)", "best->dgpu_read / 1048576.0"])
     stats = block(mem, "void memory_end_submission(")
     need("vk_memory.cpp: memory_end_submission()", stats,
-         ["if (dgpu_on()) {", "dgpu_pick(direct_bytes_by_pool);", "p.dgpu_wrote = 0;", "if (dgpu_on()) dgpu_trials();"])
+         ["if (dgpu_on()) {", "dgpu_pick();", "p.dgpu_read = 0; p.dgpu_wrote = 0;", "if (dgpu_on()) dgpu_trials();"])
     # (the GPU time the trials read: the recordings' own timestamps, and a total that the 120-frame reset of
     # st_gpu_ns does not touch)
     need("vk_replay.cpp: gpu_time_collect()", block(replay, "void gpu_time_collect(Recording& r)"),
