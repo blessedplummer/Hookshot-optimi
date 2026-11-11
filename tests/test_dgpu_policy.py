@@ -5,8 +5,8 @@ The switch has four decisions that do not need a GPU to check, and this cuts the
 - the gate: the policy asked for, and the mirrors it tunes on (RX_VK_MIRROR=0 wins);
 - a pool's class: a GPU-written pool is a render target and must be mirrored; a static (never-written) one stays
   direct in guest memory unless a measured trial kept it;
-- the sparse write-back's runs: only the pages the CPU read (the readback registry), clipped to the written range,
-  adjacent pages merged;
+- the write-back gate: only a pool the CPU has read a page of is copied back to guest memory (a pure render target's
+  GPU writes stay device-local);
 - the trial: whether a window's GPU time says the mirror pays, and the phase clock (settle, measure, decide).
 
 CPU-compiled, no game/GPU.
@@ -32,16 +32,13 @@ def main():
     start = text.index('// ---- (RX_VK_DGPU) policy decisions')
     end = text.index('// ---- end of the policy decisions ----') + len('// ---- end of the policy decisions ----')
     decisions = text[start:end]
-    for name in ('dgpu_policy_on', 'dgpu_pool_mirrored', 'dgpu_writeback_runs', 'dgpu_trial_keeps', 'dgpu_trial_step'):
+    for name in ('dgpu_policy_on', 'dgpu_pool_mirrored', 'dgpu_pool_writes_back', 'dgpu_trial_keeps', 'dgpu_trial_step'):
         if name not in decisions:
             raise SystemExit('the policy-decisions block is missing %s: cut markers moved' % name)
     fixture = r'''
-#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
-#include <utility>
-#include <vector>
 #define CHECK(ok) do { if (!(ok)) { std::fprintf(stderr, "failed line %d: %s\n", __LINE__, #ok); std::exit(1); } } while (0)
 ''' + decisions + r'''
 int main() {
@@ -55,38 +52,9 @@ int main() {
     CHECK(dgpu_pool_mirrored(false, true));    // (a trial proved the mirror pays)
     CHECK(dgpu_pool_mirrored(true, true));
     CHECK(!dgpu_pool_mirrored(false, false));  // (static, no trial: direct, no mirror, no write-back)
-    // (the sparse write-back: only the pages the CPU read, clipped to the written range)
-    using Runs = std::vector<std::pair<uint64_t, uint64_t>>;
-    const uint64_t PS = 12;   // (4 KB pages, as kPageShift)
-    bool read[16] = {};
-    Runs out;
-    // pages 1 and 2 read, whole range: one merged run
-    read[1] = read[2] = true;
-    dgpu_writeback_runs(0x1000, 0x5000, PS, [&](uint32_t pg) { return pg < 16 && read[pg]; }, out);
-    CHECK(out.size() == 1 && out[0].first == 0x1000 && out[0].second == 0x3000);
-    // page 3 not read: two runs, and the range's start/end clipped into its pages
-    out.clear();
-    read[0] = read[1] = read[3] = false, read[2] = true;
-    dgpu_writeback_runs(0x1800, 0x3800, PS, [&](uint32_t pg) { return pg < 16 && read[pg]; }, out);
-    CHECK(out.size() == 1 && out[0].first == 0x2000 && out[0].second == 0x3000);
-    out.clear();
-    read[1] = read[3] = true, read[2] = false;
-    dgpu_writeback_runs(0x1800, 0x4000, PS, [&](uint32_t pg) { return pg < 16 && read[pg]; }, out);
-    CHECK(out.size() == 2);
-    CHECK(out[0].first == 0x1800 && out[0].second == 0x2000);
-    CHECK(out[1].first == 0x3000 && out[1].second == 0x4000);
-    // (no page read: nothing, not a whole-range copy)
-    out.clear();
-    dgpu_writeback_runs(0x1000, 0x9000, PS, [&](uint32_t) { return false; }, out);
-    CHECK(out.empty());
-    // (an empty range: nothing)
-    out.clear();
-    dgpu_writeback_runs(0x2000, 0x2000, PS, [&](uint32_t) { return true; }, out);
-    CHECK(out.empty());
-    // (a range inside one page, read: clipped both ends)
-    out.clear();
-    dgpu_writeback_runs(0x1100, 0x1200, PS, [&](uint32_t pg) { return pg == 1; }, out);
-    CHECK(out.size() == 1 && out[0].first == 0x1100 && out[0].second == 0x1200);
+    // (the write-back gate: a pool the CPU read keeps stock's write-backs; a pure render target's stay device-local)
+    CHECK(dgpu_pool_writes_back(true));
+    CHECK(!dgpu_pool_writes_back(false));
     // (the trial's decision: mirrored must be at least 3% and 0.05 ms faster)
     CHECK(dgpu_trial_keeps(10.0, 9.5, 0.03, 0.05));     // (9.5 * 1.03 + 0.05 = 9.835 <= 10)
     CHECK(!dgpu_trial_keeps(10.0, 9.9, 0.03, 0.05));    // (10.247 > 10)
@@ -101,9 +69,9 @@ int main() {
     CHECK(dgpu_trial_step(1, S + W, S, W) == 2);        // (settled: measure now)
     CHECK(dgpu_trial_step(2, S + W - 1, S, W) == 2);
     CHECK(dgpu_trial_step(2, S + W, S, W) == 3);        // (measured: decide now)
-    std::puts("PASS: the gate needs the switch and the mirrors; static pools stay direct without a trial; the sparse "
-              "write-back takes only the CPU-read pages, clipped and merged; the trial keeps only a measured win and "
-              "its clock settles, measures and decides at the window's edge");
+    std::puts("PASS: the gate needs the switch and the mirrors; static pools stay direct without a trial; only a pool "
+              "the CPU read is copied back; the trial keeps only a measured win and its clock settles, measures and "
+              "decides at the window's edge");
 }
 '''
     with tempfile.TemporaryDirectory(prefix='dgpu-policy-') as tmp:

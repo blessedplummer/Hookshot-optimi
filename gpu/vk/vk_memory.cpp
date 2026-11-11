@@ -2112,10 +2112,12 @@ bool mirror_on() {
 // - a pool the GPU has never written is static: bound in guest memory, never mirrored, shadowed or captured. A measured
 //   per-pool trial may keep one mirrored (item 3), remembered in hookshot_dgpu_mirrors.txt beside the executable, as
 //   hookshot_options.ini is (the pattern its own keep list uses: the addresses are the same every run).
-// - a pool the GPU writes gets its mirror as the authoritative device-local copy (a render target), and a write-back
-//   copies only the pages the CPU read (memory_note_readback, rb_pages), resolved at the submission's end.
-// - the write-back diff's shadows are not made: page-sparse copies are already tiny, and the pass and its barriers are
-//   exactly the GPU work the readbacks wait on.
+// - a pool the GPU writes gets its mirror as the authoritative device-local copy (a render target). Its write-back is
+//   kept whole only when the CPU has read a page of it (memory_note_readback); a pure render target's never goes back -
+//   measured: skipping those copies is what the CPU-bound sync cost was, but skipping them for the pools the game itself
+//   reads changed what it drew (3941 against 1364 draws a frame, RX_VK_WB_MAX_KB=1, same save and scene at 4K).
+// - the write-back diff's shadows are not made under the policy: the copies that remain are few, and the diff pass and
+//   its barriers are exactly the GPU work the readbacks wait on.
 bool dgpu_on() {
     static const bool on = [] {
         const char* e = getenv("RX_VK_DGPU");
@@ -2132,40 +2134,27 @@ bool dgpu_on() {
 bool dgpu_active() {
     static const bool v = dgpu_policy_on(dgpu_on(), mirror_on());
     return v;
-}/// (RX_VK_DGPU) Whether a pool gets a mirror at all: a render target (the GPU wrote it) must, since its device-local
+}
+
+/// (RX_VK_DGPU) Whether a pool gets a mirror at all: a render target (the GPU wrote it) must, since its device-local
 /// copy is the one the GPU writes; static data gets one only when a trial (or the keep list) proved it pays.
 // ---- (RX_VK_DGPU) policy decisions (tests/test_dgpu_policy.py cuts this block whole) ----
 inline bool dgpu_pool_mirrored(bool wrote_gpu, bool trial_keep) {
     return wrote_gpu || trial_keep;
 }
 
+/// (RX_VK_DGPU) Whether a pool's GPU writes go back to guest memory under the policy: only if a page of it has been
+/// read by the CPU (dgpu_read, set by a readback). A pure render target's do not - that copy was the sync cost.
+/// (Pool granularity, not page: the game reads GPU results outside the readback API too, and page-sparse copies broke
+/// that - the draw counts measured above. Where the CPU looks, guest memory is coherent; where it never looks, no copy.)
+inline bool dgpu_pool_writes_back(bool read_by_cpu) {
+    return read_by_cpu;
+}
+
 /// (RX_VK_DGPU) The switch's gate, pure: the policy asked for, and the mirrors it tunes both on (RX_VK_MIRROR=0 is the
 /// older switch and wins). (cut whole by tests/test_dgpu_policy.py)
 inline bool dgpu_policy_on(bool requested, bool mirrors) {
     return requested && mirrors;
-}
-
-/// (RX_VK_DGPU) The runs of [lo, hi) a write-back copies: only the pages in the CPU's read set (rb_pages: the pages a
-/// readback made the CPU read), merged page by page. A page the CPU never read keeps its device-local bytes; guest
-/// memory is not brought up to date for it. `read` takes a page number. (pure: the caller owns the read set; cut whole
-/// by tests/test_dgpu_policy.py)
-template <typename Read>
-void dgpu_writeback_runs(uint64_t lo, uint64_t hi, uint64_t page_shift, Read&& read,
-                         std::vector<std::pair<uint64_t, uint64_t>>& out) {
-    if (hi <= lo) return;
-    uint64_t run_lo = 0, run_hi = 0;
-    bool have = false;
-    for (uint64_t page = lo >> page_shift; page <= (hi - 1) >> page_shift; page++) {
-        if (!read((uint32_t)page)) continue;
-        const uint64_t a = std::max(page << page_shift, lo), b = std::min((page + 1) << page_shift, hi);
-        if (have && run_hi == a) {
-            run_hi = b;
-            continue;
-        }
-        if (have) out.push_back({run_lo, run_hi});
-        run_lo = a, run_hi = b, have = true;
-    }
-    if (have) out.push_back({run_lo, run_hi});
 }
 
 /// (RX_VK_DGPU) Whether a trial's two windows say a static pool's mirror pays: the GPU took at least `margin` and
@@ -3821,38 +3810,15 @@ void memory_end_submission(VkCommandBuffer cmd) {
                     runs.push_back({w.lo, w.lo, w.hi - w.lo});
             }
             cut_cpu_words(*p, runs);
-            // (RX_VK_DGPU) A render target's write-back is sparse: only the pages the CPU read (rb_pages, the readback
-            // registry) go back to guest memory, page by page and merged. Resolved here, at the submission's end, not at
-            // the binding: a readback replayed after the binding must still count. The pages nobody reads keep their
-            // device-local bytes; guest memory is not brought up to date for them (that whole-range copy was the sync
-            // cost: 3344.4 MB compared over 600 submits at 4K, issue #2099). The expiry matches memory_rb_refresh's.
-            if (dgpu_active() && !runs.empty()) {
-                static thread_local std::vector<std::pair<uint64_t, uint64_t>> sparse;
-                sparse.clear();
-                uint64_t kept_bytes = 0;
-                for (const VkBufferCopy& r : runs) {
-                    const uint64_t lo = r.dstOffset, hi = r.dstOffset + r.size;
-                    const size_t before = sparse.size();
-                    dgpu_writeback_runs(lo, hi, kPageShift, [&](uint32_t page) {
-                        const auto it = rb_pages.find(page);
-                        return it != rb_pages.end() && it->second + 600 >= mirror_epoch;
-                    }, sparse);
-                    uint64_t page_bytes = 0;
-                    for (size_t k = before; k < sparse.size(); k++) page_bytes += sparse[k].second - sparse[k].first;
-                    kept_bytes += page_bytes;
-                    st_dgpu_wb_dropped += (int64_t)(r.size - page_bytes);
-                }
+            // (RX_VK_DGPU) A pool the CPU never read (no readback page in it) is a pure render target: it stays
+            // device-local and nothing is copied back (item 1: 67.67 MB a frame went back at 4K in Hyrule Field, and the
+            // GPU time it took is the readbacks' wait). A pool the CPU *has* read keeps its write-backs whole, stock's
+            // way: the game also reads GPU results outside the readback API (the replay's own conditions), and skipping
+            // those changed what it drew - 3941 draws a frame against 1364 with every write-back off (RX_VK_WB_MAX_KB=1,
+            // same save, same Hyrule Field noon scene, 4K). Coherence where the CPU looks, none where it does not.
+            if (dgpu_active() && !dgpu_pool_writes_back(p->dgpu_read) && !runs.empty()) {
+                for (const VkBufferCopy& r : runs) st_dgpu_wb_dropped += (int64_t)r.size;
                 runs.clear();
-                uint64_t prev_end = 0;
-                for (const auto& [lo, hi] : sparse) {
-                    if (!runs.empty() && lo <= prev_end) {   // (runs of the same pool: adjacent pages merge)
-                        runs.back().size = std::max(runs.back().size, hi - runs.back().dstOffset);
-                    } else {
-                        runs.push_back({lo, lo, hi - lo});
-                    }
-                    prev_end = hi;
-                }
-                st_dgpu_wb_pages += (int64_t)sparse.size();
             }
             if (runs.empty()) continue;
             checkpoint_mark(cmd, p->lo, 'b');
