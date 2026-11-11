@@ -41,6 +41,11 @@ static void require(bool condition, const char* message) {
 struct ParLock { ParLock() {} ~ParLock() {} };
 static void texture_gpu_wrote(uint64_t, uint64_t) { ++texture_writes; }
 static void rb_hazard_locked(uint64_t lo, uint64_t hi) { ++hazards; hazard_lo = lo; hazard_hi = hi; }
+// (dirty-origin scaffolding: the cut gpu_buffer_bind calls these on the oversize path. RX_VK_WB_MAX_KB is unset here,
+// so wb_max is 0 and the gate short-circuits; the split reads on by default. None of them execute, only compile)
+static bool dirty_origin_on() { return true; }
+static bool memory_written_since(uint64_t, uint64_t, uint32_t) { return false; }
+static int64_t st_wb_large_kept = 0, st_wb_large_skipped = 0;
 static bool mirror_on() { return mirrors; }
 static Pool* pool_of(uint64_t guest, uint64_t size) {
     ++lookups;

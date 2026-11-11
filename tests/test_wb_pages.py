@@ -1,5 +1,7 @@
 """The write-back page table (gpu/vk/vk_memory.cpp WbPages): values per page in chunks made on first use, and max_in, which
 reads a range of pages skipping whole chunks never made. Built with small chunks so their edges are easy to reach.
+Also pending (dirty-origin, Phase 1): a page whose write-back is still in flight (its value past done) is never
+culled by the end's intersection.
 
 python -I -B tests/test_wb_pages.py [--cxx clang++]
 """
@@ -61,7 +63,13 @@ int main() {
     CHECK(t.get(64) == 0 && t.get(1000) == 0);
     t.set(63, 4);   // (the table's last page; a range reaching past the end stops there)
     CHECK(range(t, 63, 1000, true) == 4 && range(t, 41, 62, false) == 0 && range(t, 41, 1000, true) == 4);
-    std::puts("PASS: values per page, ranges over chunks never made, chunk edges and the table's end");
+    // (dirty-origin, Phase 1: pending: a page whose write-back is still in flight (value past done). The end's
+    // intersection culls nothing of such pages (readback ordering); here the predicate itself)
+    CHECK(!t.pending(3, 7) && t.pending(3, 6) && t.pending(40, 8));   // (value past done, strictly)
+    CHECK(t.pending(15, 0) && !t.pending(15, 1));   // (replaced value 11 -> 1: pending against 0 only)
+    CHECK(!t.pending(4, 0) && !t.pending(64, 0) && !t.pending(1000, 0));   // (never written, past the end: never pending)
+    CHECK(t.pending(63, 3) && !t.pending(63, 4));   // (the table's last page)
+    std::puts("PASS: values per page, ranges over chunks never made, chunk edges, the table's end, pending write-backs");
 }
 '''
     with tempfile.TemporaryDirectory(prefix='wb-pages-') as tmp:

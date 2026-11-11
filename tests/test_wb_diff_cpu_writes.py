@@ -10,6 +10,11 @@ game's conditions read, counted to last frame's value again, stayed cleared). Th
 - the in-stream clear (NOP_CLEAR_BUF) and the report words write through guest_cpu_write
 - a written binding given the guest buffer of a mirrored pool forgets its pages (shadow_forget)
 
+Dirty-origin, Phase 1 (extends #1629's RX_VK_WB_MAX_KB gate): GPU writes stamp gpu_gen (memory_stamp_gpu,
+rb_hazard_locked), never page_gen; mirror_sync skips GPU-dirty-only pages; large both-dirty bindings still queue;
+the capture prunes GPU-only tex/small-pool ranges; the end culls to unknown-or-GPU-dirty-or-pending pages. Each
+behavior has a check below reading the source.
+
 tests/test_wb_diff_stale_shadow.py runs the sequence itself.
 
 python -I -B tests/test_wb_diff_cpu_writes.py
@@ -78,6 +83,71 @@ class ShadowReports(unittest.TestCase):
         self.assertIn("guest_cpu_write(c0.dst, words, ", clear)   # (the in-stream clear of the conditions' counters)
         self.assertNotIn("host->gpu_write(", clear)
         self.assertRegex(self.replay, r"guest_cpu_write\(c\.addr, rec, sizeof rec\)")   # (the report words)
+
+    def test_gpu_writes_stamp_gpu_gen_not_page_gen(self):
+        stamp = body(self.memory, "void memory_stamp_gpu(uint64_t guest, uint64_t size) {")
+        self.assertIn("stamp_gpu_range(guest, size)", stamp)   # (GPU writes stamp gpu_gen at bind/record time)
+        self.assertNotIn("memory_stamp(guest, size)", stamp)   # (...no longer page_gen: the CPU's table stays the CPU's)
+        hazard = body(self.memory, "void rb_hazard_locked(uint64_t lo, uint64_t hi) {")
+        self.assertIn("stamp_gpu_range(lo, hi - lo)", hazard)   # (every range bound for GPU write, same submission)
+
+    def test_mirror_sync_skips_gpu_dirty_only_pages(self):
+        sync = body(self.memory, "void mirror_sync(Pool& p) {")
+        self.assertIn("dirty_origin_of(", sync)   # (re-keyed on the page's origin, not page_gen alone)
+        self.assertIn("st_sync_gpu_only", sync)   # (GPU-dirty-only skipped: the mirror holds the truth)
+        self.assertIn(", 0, true}", sync)   # (skipped pages marked GPU-origin in CapEntry)
+        self.assertIn("!e.gpu && e.gen && e.gen == pg", sync)   # (GPU-origin marks hold no copy)
+        read = body(self.memory, "bool memory_read_as_submitted(uint64_t gpu, void* dst, uint64_t n) {")
+        self.assertIn("e.gpu ||", read)
+        entry = body(self.memory, "struct CapEntry {")
+        self.assertIn("bool gpu", entry)
+
+    def test_large_both_dirty_bindings_still_queue(self):
+        bind = body(self.memory, "BufferRef gpu_buffer_bind(uint64_t gpu, uint64_t size, bool written) {")
+        self.assertIn("RX_VK_WB_MAX_KB", bind)   # (#1629's coarse size gate stays)
+        self.assertIn("memory_writeback_value(", bind)   # (GPU results the CPU read back before: both-dirty)
+        self.assertIn("memory_written_since(", bind)   # (a page the CPU wrote since the pool's sync: both-dirty)
+        self.assertIn("st_wb_large_kept", bind)   # (still queued; the end narrows them instead of copying them whole)
+        self.assertIn("rb_hazard_locked(", bind)   # (the hazard is noted whether the binding queues or not)
+
+    def test_capture_prunes_gpu_only_scan_ranges(self):
+        make = body(self.memory, "std::unique_ptr<Capture> capture_make() {")
+        self.assertIn("mirrored_full", make)
+        self.assertIn("mirrored_cap", make)   # (mirrored pools always stay: their captures fix the flashes)
+        self.assertIn("memory_written_since(", make)   # (tex/small-pool ranges: only those with any CPU-dirty page)
+        self.assertIn("st_cap_pruned", make)
+        self.assertIn("prune_seen", make)   # (the lagging base: hot ranges stay scanned; odd submits scan everything)
+        take = body(self.memory, "bool take_capture(std::unique_ptr<Capture> c, uint64_t value, uint64_t completed) {")
+        self.assertIn("CapEntry{g, c->slots[i], false}", take)   # (a CPU copy clears any GPU-origin mark)
+
+    def test_end_culls_to_unknown_or_gpu_dirty_or_pending(self):
+        end = body(self.memory, "void memory_end_submission(VkCommandBuffer cmd) {")
+        self.assertIn("wbd_keep_page(", end)   # (unknown-to-shadow pages, GPU-dirty ones, pending ones: kept)
+        self.assertIn("wb_pending_pages", end)   # (a page with a write-back still in flight is never culled)
+        self.assertIn("binary_search(wb_pending_pages", end)
+        self.assertIn("p->gpu_synced", end)   # (GPU-dirty against the pool's own baseline)
+        self.assertIn("p->synced_gen = gen_now, p->gpu_synced = gpu_now", end)   # (both baselines advance together)
+
+    def test_kill_switch_covers_all_split_sites(self):
+        on = body(self.memory, "bool dirty_origin_on() {")
+        self.assertIn('getenv("RX_VK_DIRTY_ORIGIN")', on)
+        self.assertIn("atoi(e) != 0", on)   # (default on: off only when set to 0)
+        stamp = body(self.memory, "void memory_stamp_gpu(uint64_t guest, uint64_t size) {")
+        self.assertIn("else memory_stamp(guest, size)", stamp)   # (off: page_gen for all writes, as before)
+        for sig in ("void rb_hazard_locked(uint64_t lo, uint64_t hi) {",
+                    "void mirror_sync(Pool& p) {",
+                    "BufferRef gpu_buffer_bind(uint64_t gpu, uint64_t size, bool written) {",
+                    "std::unique_ptr<Capture> capture_make() {",
+                    "void memory_end_submission(VkCommandBuffer cmd) {"):
+            self.assertIn("dirty_origin_on()", body(self.memory, sig), sig)
+
+    def test_bare_table_writes_are_stamped_through_the_hazard(self):
+        prot = body(self.memory, "void memory_protect_gpu(uint64_t guest, uint64_t size) {")
+        self.assertNotIn("stamp_gpu_range(", prot)   # (no separate stamp: the hazard range stamps gpu_gen)
+        self.assertIn("rb_hazard_locked", prot)   # (the covering path is documented, not assumed)
+        draw = (VK / "vk_draw.cpp").read_text(encoding="utf-8")
+        self.assertIn("memory_protect_gpu(guest, n)", draw)
+        self.assertIn("memory_note_gpu_write(base, n)", draw)   # (the same bind's range, hazard-noted unconditionally)
 
 
 if __name__ == "__main__":

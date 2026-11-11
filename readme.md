@@ -703,6 +703,11 @@ memory sync: in Hyrule Field on a 10 GB RTX 3080, about 66 MB and 4.4 ms a submi
 `RX_VK_WB_MAX_KB=1024` still copies the small results the CPU does read (the exposure meter and the like) and took the
 same scene to 59-60 fps. `0` or unset copies every written binding, as before.
 
+`RX_VK_DIRTY_ORIGIN=0` turns the dirty-origin split off again: GPU writes stamp the CPU's page generations as before,
+mirror syncs copy every dirty page, captures scan every range and write-backs copy whole runs. On by default; off is
+the pre-split behavior (and #1629's size gate unmodified). Set it for an A/B when a flash or a slowdown looks like the
+split's doing.
+
 </details>
 
 ## How it works

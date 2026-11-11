@@ -51,6 +51,19 @@ def main():
         body = block(source, name)
         if "cap_view_bump()" not in body:
             raise SystemExit(f"{name} changes page state without dropping the cached read")
+    # (dirty-origin: MiMo's audit. A GPU write lands in the mirror, never guest memory, until the write-back copies it
+    # back, and that copy is a GPU transfer the host watch never sees — so the cached answer keys on the CPU
+    # generation and the capture view only, before and after the split. The reuse predicate takes no GPU state, and
+    # the call site passes page_gen (CPU) and the view. A regression here would serve mirror bytes as guest memory)
+    read = block(source, "bool memory_read_as_submitted(")
+    reuse = read[:read.index("std::lock_guard lk(pools_mu)")]
+    if "gpu_page_gen" in reuse or "mirror_sync" in reuse:
+        raise SystemExit("the cached read consults GPU state: it must key on the CPU generation and the view only")
+    if "submitted_page_reuse(page0, page_gen(page0)" not in read:
+        raise SystemExit("the cached read no longer keys on the CPU page generation")
+    fn = block(source, "bool submitted_page_reuse(")
+    if "gpu" in fn:
+        raise SystemExit("the reuse predicate grew GPU state: cached answers must survive mirror writes by construction")
     fixture = f'''#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -61,6 +74,9 @@ def main():
 {pages}
 {slot}
 int main() {{
+    // (dirty-origin: no GPU parameter exists on either side of the reuse decision: a mirror write cannot change a
+    // cached answer, by construction. The keys are the CPU page generation and the capture view, as the source
+    // checks above pin down)
     CHECK(submitted_page_reuse(9, 4, 7, 9, 4, 7));
     CHECK(!submitted_page_reuse(9, 4, 8, 9, 4, 7));
     CHECK(!submitted_page_reuse(9, 5, 7, 9, 4, 7));

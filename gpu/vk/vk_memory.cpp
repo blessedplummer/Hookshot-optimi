@@ -64,6 +64,7 @@ struct Pool {
     VkBuffer mirror = VK_NULL_HANDLE;
     VmaAllocation mirror_alloc = nullptr;
     uint32_t synced_gen = 0;     // every page stamped up to this generation is in the mirror
+    uint32_t gpu_synced = 0;       // (dirty-origin: every GPU write stamped up to this gpu_now is in the mirror)
     uint64_t synced_epoch = 0;   // the submission that last brought it up to date
     uint64_t sync_seg = 0;       // (and the parallel replay's segment whose uploads did)
     uint64_t last_value = 0;     // (the newest submission that bound it: its mirror is in use until that one is done)
@@ -626,6 +627,66 @@ void stamp_page(uint64_t p, uint32_t g) {
     store_u32(c[p % kChunkPages], g);
     region_gen[p / kRegionPages] = g;
 }
+
+// ---- GPU write generations (dirty-origin split, Phase 1; extends #1629) ----
+// A parallel stamp alongside page_gen for the pages the GPU writes (guest-pool pages bound for GPU write, stamped at
+// bind/record time in rb_hazard_locked and memory_stamp_gpu). Same two levels, same 4 KB pages, its own counter
+// (gpu_now, bumped once a submission in memory_begin_submission) and its own per-pool sync baseline (Pool::gpu_synced,
+// set where synced_gen is). A page's state against its pool's two baselines:
+// CPU-dirty, GPU-dirty, both, or clean (dirty_origin_of, cut by tests/test_wb_diff_split.py).
+// What it does NOT do (Phase 2): no shader, no GPU kernel reads this; the write-back diff's pass is unchanged.
+// Locking: atomic stores like the CPU table (chunk allocation races read the same benign way the CPU table's do).
+namespace {
+std::vector<std::unique_ptr<uint32_t[]>> gpu_gen_chunks(kPages / kChunkPages);
+std::vector<uint32_t> gpu_region_gen(kPages / kRegionPages);
+std::vector<uint32_t> gpu_region_full(kPages / kRegionPages);
+inline uint32_t gpu_page_gen(uint64_t p) {
+    const auto& c = gpu_gen_chunks[p / kChunkPages];
+    return std::max(c ? load_u32(c[p % kChunkPages]) : 0u, load_u32(gpu_region_full[p / kRegionPages]));
+}
+uint32_t gpu_now = 1;
+void stamp_gpu_page(uint64_t p, uint32_t g) {
+    if (p >= kPages) return;
+    auto& c = gpu_gen_chunks[p / kChunkPages];
+    if (!c) {
+        c.reset(new uint32_t[kChunkPages]);
+        std::fill(c.get(), c.get() + kChunkPages, 0u);
+    }
+    store_u32(c[p % kChunkPages], g);
+    gpu_region_gen[p / kRegionPages] = g;
+}
+void stamp_gpu_range(uint64_t guest, uint64_t size) {   // (pools_mu or ParLock held, as its callers are)
+    if (!size) return;
+    const uint32_t g = gpu_now;
+    const uint64_t p0 = guest >> kPageShift, p1 = std::min((guest + size - 1) >> kPageShift, kPages - 1);
+    for (uint64_t p = p0; p <= p1;) {
+        if (p % kRegionPages == 0 && p + kRegionPages - 1 <= p1) {   // (a whole region)
+            store_u32(gpu_region_full[p / kRegionPages], g);
+            gpu_region_gen[p / kRegionPages] = g;
+            p += kRegionPages;
+            continue;
+        }
+        stamp_gpu_page(p++, g);
+    }
+}
+} // namespace
+// (a page's dirty origin from its two stamps against its pool's two syncs: 0 clean, 1 CPU-only, 2 GPU-only, 3 both.
+// Pure: cut by tests/test_wb_diff_split.py)
+inline uint8_t dirty_origin_of(uint32_t cpu, uint32_t gpu, uint32_t cpu_synced, uint32_t gpu_synced) {
+    return (uint8_t)(((cpu > cpu_synced) ? 1 : 0) | ((gpu > gpu_synced) ? 2 : 0));
+}
+// (dirty-origin kill switch: RX_VK_DIRTY_ORIGIN=0 restores the pre-split paths (page_gen for all writes, no sync
+// skip, #1629's gate unmodified, no scan prune, no end cull). Default on. Read once; the baselines and counters keep
+// advancing while off, but nothing reads them. tests/test_wb_diff_cpu_writes.py)
+bool dirty_origin_on() {
+    static const bool on = [] {
+        const char* e = getenv("RX_VK_DIRTY_ORIGIN");
+        const bool v = !e || atoi(e) != 0;
+        logf("vk: dirty-origin split %s (RX_VK_DIRTY_ORIGIN=0: off)", v ? "on" : "off");
+        return v;
+    }();
+    return on;
+}
 } // namespace
 
 namespace { void cap_view_bump(); }   // (defined with cap_view_gen below, in this file's anonymous namespace)
@@ -705,11 +766,19 @@ bool gpu_pages_on() {
 }
 void memory_stamp_gpu(uint64_t guest, uint64_t size) {
     if (!size) return;
-    memory_stamp(guest, size);
+    // (dirty-origin, Phase 1: a GPU write stamps gpu_gen, no longer page_gen. The CPU's table stays the CPU's, so
+    // mirror_sync's live path, the capture's scan and texture uploads read CPU dirt only; #1629's size gate and the
+    // end's narrowing read gpu_gen for the GPU's side. Guest memory is unchanged until the write-back, so no shadow
+    // drop; submitted reads still stand, so no cap_view_bump. All three callers are genuine GPU writes: vk_draw's
+    // storage buffers, vk_replay's buffer copies/clears and vk_xfer's texture-to-buffer copies)
+    if (dirty_origin_on()) stamp_gpu_range(guest, size);
+    else memory_stamp(guest, size);   // (off: page_gen for all writes, as before)
     if (!gpu_pages_on()) return;
     std::lock_guard lk(gpu_pages_mu);
     const uint64_t p0 = guest >> kPageShift, p1 = (guest + size - 1) >> kPageShift;
     if (p1 - p0 > 4096) return;   // (big copies: not tracked)
+    // (keyed by the CPU generation: diagnostic only, read only with RX_VK_GPU_PAGES=1. The split's baseline is
+    // gpu_now (gpu_page_gen); this map's values are never compared, only its presence. Do not use them as gens)
     for (uint64_t p = p0; p <= p1; p++) gpu_pages[(uint32_t)p] = gen_now;
     if (gpu_pages.size() > 2000000) gpu_pages.clear();
 }
@@ -739,6 +808,10 @@ bool prot_page_since(uint64_t page, uint32_t synced) {
 }
 void memory_protect_gpu(uint64_t guest, uint64_t size) {
     if (!size || !protect_bare_on()) return;
+    // (no stamp_gpu_range here, by decision: the same bind's hazard range already stamps gpu_gen through
+    // rb_hazard_locked (vk_draw.cpp notes bare/wide ranges via memory_note_gpu_write, and the written head through
+    // its own bind), unconditionally on PROTECT_BARE. gpu_gen must not depend on this experiment's flag, and the
+    // ranges coincide: the hazard covers the whole guess, this table the same pages. tests/test_wb_diff_cpu_writes.py)
     const uint64_t p0 = guest >> kPageShift, p1 = (guest + size - 1) >> kPageShift;
     if (p1 - p0 > 16384) return;   // (64 MB at most: a guess past that is not the GPU's records)
     std::lock_guard lk(prot_mu);
@@ -810,12 +883,15 @@ std::vector<std::unique_ptr<Capture>> spare;   // (taken ones, their buffers kep
 // until the work that copies from it is done); a sync copies a dirty page from there, else from guest memory.
 // (A flat table and generations: the hash maps' node allocations took ~0.7 ms a submit, the replay's.)
 // (RX_VK_SYNC_LIVE=1: dirty pages not in their submission's capture read from guest memory, as before)
-struct CapEntry { uint32_t gen, slot; };
+// (a page's GPU-origin mark is set where GPU-dirty-only pages are skipped (mirror_sync); cleared when the CPU's
+// capture publishes the page. Phase 1 sets it; only Phase 2's kernels will read it: every Phase-1 reader skips
+// e.gpu entries explicitly. tests/test_wb_diff_cpu_writes.py)
+struct CapEntry { uint32_t gen, slot; bool gpu = false; };
 constexpr uint64_t kCapChunkPages = 1u << 16;   // (a chunk of the table: 256 MB of guest memory, made when first used)
 std::vector<std::unique_ptr<CapEntry[]>> cap_table;
 inline CapEntry cap_entry(uint64_t page) {
     const uint64_t c = page / kCapChunkPages;
-    if (c >= cap_table.size() || !cap_table[c]) return {0, 0};
+    if (c >= cap_table.size() || !cap_table[c]) return {0, 0, false};
     return cap_table[c][page % kCapChunkPages];
 }
 inline void cap_entry_set(uint64_t page, CapEntry e) {
@@ -909,6 +985,7 @@ uint64_t cap_ranges_ver = 1;   // (any of the captures' range lists changed: cap
 std::vector<std::pair<uint64_t, uint64_t>> pool_cap_ranges;   // (merged; cap_ranges_mu)
 uint32_t pool_cap_gen = 0;
 uint64_t captures_made = 0, pool_cap_built = 0;              // (cap_ranges_mu)
+int64_t st_cap_pruned = 0;   // (dirty-origin: tex/small-pool scan ranges skipped as GPU-only since the scan before last)
 std::unordered_map<uint64_t, uint64_t> pool_first_seen;     // (a pool's start -> the capture it was first seen at)
 uint64_t capture_pool_max() {
     static const uint64_t v = (getenv("RX_VK_CAPTURE_POOL_MB") ? (uint64_t)atoll(getenv("RX_VK_CAPTURE_POOL_MB")) : 64) << 20;
@@ -1103,6 +1180,11 @@ bool memory_read_as_submitted(uint64_t gpu, void* dst, uint64_t n) {
     if (!guest) return true;
     const uint64_t page0 = guest >> kPageShift, page1 = (guest + n - 1) >> kPageShift;
     const uint64_t view = cap_view_gen.load(std::memory_order_acquire);
+    // (dirty-origin: the cached answer keys on the CPU generation and the capture view only, and that is sufficient.
+    // A GPU write lands in the mirror, never guest memory, until the write-back copies it back; that copy is a GPU
+    // transfer the host watch never sees, so no stamp — CPU or GPU — invalidates here, before or after the split.
+    // Stale reads across a landed write-back are impossible for a second reason: take_capture always bumps the view.
+    // Keep it that way: pass page_gen (CPU) and the view, never gpu state. tests/test_submitted_page.py)
     SubmittedPage& submitted_page = submitted_page_for(page0);
     if (page0 == page1 && submitted_page_reuse(page0, page_gen(page0), view, submitted_page.page, submitted_page.pgen,
                                                submitted_page.view))
@@ -1113,7 +1195,7 @@ bool memory_read_as_submitted(uint64_t gpu, void* dst, uint64_t n) {
         std::lock_guard lk(pools_mu);
         for (uint64_t page = guest >> kPageShift; page < (guest + n + 4095) >> kPageShift; page++) {
             const CapEntry e = cap_entry(page);
-            if (!e.gen || e.gen != page_gen(page)) continue;
+            if (e.gpu || !e.gen || e.gen != page_gen(page)) continue;   // (GPU-origin marks hold no copy)
             auto b = cap_bufs.find(e.gen);
             if (b == cap_bufs.end() || !b->second.map) continue;
             const uint64_t a = std::max(page << kPageShift, guest), z = std::min((page + 1) << kPageShift, guest + n);
@@ -1231,6 +1313,11 @@ struct WbPages {
         if (page >= kPages) return 0;
         const auto& c = chunks[page / kChunkPages];
         return c ? c[page % kChunkPages] : 0;
+    }
+    /// a page whose write-back is still in flight (its value past done): the end culls nothing of it (readback
+    /// ordering, vk_replay.cpp invalidate; tests/test_wb_pages.py)
+    bool pending(uint64_t page, uint64_t done) const {
+        return get(page) > done;
     }
     /// the largest value of pages first..last (0: none), and whether any had one; a chunk never made is skipped whole
     uint64_t max_in(uint64_t first, uint64_t last, bool* ever) const {
@@ -1479,11 +1566,16 @@ std::unique_ptr<Capture> capture_make() {
     // collection, over every GPU range, is ~20 ms: 4 of them a frame on the game's thread made it crawl. The replay's
     // collection takes the rest, as before)
     // (the list the replay publishes when it makes mirrors: pools_mu here waited ~40 ms a submit for the replay)
-    static thread_local std::vector<std::pair<uint64_t, uint64_t>> mirrored;
+    static thread_local std::vector<std::pair<uint64_t, uint64_t>> mirrored_full;   // (the union below)
+    static thread_local std::vector<std::pair<uint64_t, uint64_t>> mirrored_cap;    // (its mirrored-pool part)
+    static thread_local std::vector<std::pair<uint64_t, uint64_t>> mirrored;        // (this scan's input: pruned below)
+    static std::atomic<uint32_t> prune_seen{0};   // (gen_now at the last pruning scan: the prune's lagging base)
+    bool prune = false;
     {   // (and the texture storage the replay uploads from: see "texture storage in the capture"; and the small pools)
         std::lock_guard lk(cap_ranges_mu);
         captures_made++;
         refresh_pool_ranges_locked();
+        prune = (captures_made & 1) == 0 && dirty_origin_on();   // (even submits: prune; odd ones scan everything, so no range starves past one submit; off: everything)
         static thread_local uint64_t ver = 0;
         if (ver != cap_ranges_ver) {   // (the three lists overlap: their union, sorted, once each time one changes)
             ver = cap_ranges_ver;
@@ -1491,15 +1583,45 @@ std::unique_ptr<Capture> capture_make() {
             all.insert(all.end(), tex_cap_ranges.begin(), tex_cap_ranges.end());
             all.insert(all.end(), pool_cap_ranges.begin(), pool_cap_ranges.end());
             std::sort(all.begin(), all.end());
-            mirrored.clear();
+            mirrored_full.clear();
             for (const auto& r : all) {
-                if (!mirrored.empty() && r.first <= mirrored.back().second)
-                    mirrored.back().second = std::max(mirrored.back().second, r.second);
+                if (!mirrored_full.empty() && r.first <= mirrored_full.back().second)
+                    mirrored_full.back().second = std::max(mirrored_full.back().second, r.second);
                 else
-                    mirrored.push_back(r);
+                    mirrored_full.push_back(r);
             }
+            mirrored_cap = cap_ranges;   // (sorted by pool: publish_cap_ranges iterates the map in order)
         }
     }
+    if (prune) {
+        // (dirty-origin, Phase 1: the scan span intersected with the pools having any CPU-dirty page. A merged range
+        // outside every mirrored pool (texture storage, small pools) with no CPU stamp since the scan before last is
+        // GPU-only: left out of this scan. Mirrored pools always stay: their captures fix the flashes. Fresh writes
+        // into a pruned range wait one submit at most: the host's watch keeps what a scan skips (rx_backend.c
+        // collect_in clears only scanned ranges), the collection re-marks capture-range pages for the next capture,
+        // and odd submits scan everything. Together those three are the backstop: a pruned range's marks survive in
+        // the host watch until an odd submit collects them, so no range starves past one submit. The lagging base
+        // keeps hot ranges scanned: their take stamps are newer)
+        mirrored.clear();
+        for (const auto& r : mirrored_full) {
+            if (r.second <= r.first) continue;
+            bool in_cap = false;
+            for (const auto& c : mirrored_cap) {   // (both sorted; linear intersect is enough at these counts)
+                if (c.first >= r.second) break;
+                if (c.second > r.first) { in_cap = true; break; }
+            }
+            if (!in_cap && !memory_written_since(r.first, r.second - r.first, prune_seen.load(std::memory_order_relaxed))) {
+                st_cap_pruned++;
+                continue;
+            }
+            if (!mirrored.empty() && r.first <= mirrored.back().second)
+                mirrored.back().second = std::max(mirrored.back().second, r.second);
+            else
+                mirrored.push_back(r);
+        }
+        prune_seen.store(gen_now, std::memory_order_relaxed);
+    } else
+        mirrored = mirrored_full;
     captures_seen.store(true, std::memory_order_relaxed);
     const auto t_lock = std::chrono::steady_clock::now();
     uint32_t* pages = nullptr;
@@ -1706,7 +1828,7 @@ bool take_capture(std::unique_ptr<Capture> c, uint64_t value, uint64_t completed
         cap_bufs.emplace(g, b);
         cap_bytes += b.size;
         cur_cap_gen = g;
-        for (size_t i = 0; i < c->copied.size(); i++) cap_entry_set(c->copied[i], CapEntry{g, c->slots[i]});
+        for (size_t i = 0; i < c->copied.size(); i++) cap_entry_set(c->copied[i], CapEntry{g, c->slots[i], false});   // (a CPU copy clears any GPU-origin mark)
     }
     cap_view_bump();
     if (c->map) cap_buf_free(c->buffer, c->alloc, c->map, c->bsize), c->buffer = VK_NULL_HANDLE, c->map = nullptr;
@@ -2269,6 +2391,7 @@ void retire_pool(std::map<uint64_t, Pool>::iterator it) {
 }
 int64_t st_sync_bytes, st_sync_copies, st_wb_bytes, st_mirrors;
 int64_t st_sync_live_pages, st_sync_cap_pages, st_sync_old_pages;   // (mirror syncs' dirty pages: live / this submit's capture / an earlier one's)
+int64_t st_sync_gpu_only = 0;   // (dirty-origin: GPU-dirty-only pages skipped, the mirror holds the truth)
 std::unordered_map<uint64_t, int64_t> live_by_pool;
 std::unordered_map<uint64_t, std::pair<int64_t, int>> direct_by_pool;   // (bindings the GPU reads in guest memory: count, state)
 std::unordered_map<uint64_t, uint64_t> direct_bytes_by_pool;           // (and the bytes of those bindings: what the GPU may read over PCIe, a binding's whole range)
@@ -2294,7 +2417,11 @@ void append_capture_copy(std::vector<VkBufferCopy>& runs, const VkBufferCopy& ne
     runs.push_back(next);
 }
 
-/// The pages of the pool the CPU wrote since its mirror's sync, copied in (the upload command buffer)
+/// The pages of the pool the CPU wrote since its mirror's sync, copied in (the upload command buffer).
+/// Dirty-origin (Phase 1): GPU-dirty-only pages are skipped (the mirror holds the truth; #1629's write-back brings it
+/// to guest memory). Both-dirty pages keep the existing order (capture, then live guest memory as fallback), which is
+/// the guest-refresh-first order: the write-back's late-copy wait lands in the capture before this sync reads it.
+/// CPU-dirty-only pages are unchanged: capture, then live guest memory as fallback.
 void mirror_sync(Pool& p) {
     p.synced_epoch = mirror_epoch;
     p.sync_seg = texture_segment();
@@ -2303,22 +2430,34 @@ void mirror_sync(Pool& p) {
     std::map<VkBuffer, std::vector<VkBufferCopy>> cap_runs;   // (from the captures' copies)
     uint64_t run_lo = 0, run_hi = 0;
     for (uint64_t page = p.lo >> kPageShift; page < (p.hi + 4095) >> kPageShift;) {
-        if (page % kRegionPages == 0 && region_gen[page / kRegionPages] <= p.synced_gen) {
-            page += kRegionPages;   // (a clean 2 MB region)
+        if (page % kRegionPages == 0 && region_gen[page / kRegionPages] <= p.synced_gen &&
+            (!dirty_origin_on() || gpu_region_gen[page / kRegionPages] <= p.gpu_synced)) {
+            page += kRegionPages;   // (a clean 2 MB region: neither CPU- nor GPU-dirty)
             continue;
         }
         const uint32_t pg = page_gen(page);
-        const bool dirty = pg > p.synced_gen;
+        const uint8_t origin = dirty_origin_on()
+            ? dirty_origin_of(pg, gpu_page_gen(page), p.synced_gen, p.gpu_synced)
+            : (uint8_t)(pg > p.synced_gen);   // (off: CPU dirt only, as before)
+        const bool dirty = origin & 1;
         if (dirty && gpu_page(page)) {   // (diagnostic: see memory_stamp_gpu)
             st_sync_gpu_pages++;
             const CapEntry e0 = cap_entry(page);
-            const bool live = !(e0.gen && e0.gen == pg && cap_bufs.count(e0.gen));
+            // (e0.gen is CPU-space, comparable to pg, only when !e0.gpu: a GPU-origin mark's gen lives in gpu_now
+            // space and is incomparable (never printed beside the CPU gens below); e0.gpu short-circuits to live)
+            const bool live = e0.gpu || !(e0.gen && e0.gen == pg && cap_bufs.count(e0.gen));
             st_sync_gpu_live += live;
             static int logged;
             if (logged++ < 40)
                 logf("vk: a mirror sync copies the CPU's version of page %#llx over the GPU's (pool %#llx, %s, page gen %u, "
                      "pool synced at %u, gen now %u)", (unsigned long long)(page << kPageShift), (unsigned long long)p.lo,
                      live ? "live" : "from a capture", pg, (unsigned)p.synced_gen, gen_now);
+        }
+        if (origin == 2) {   // (GPU-dirty-only: the mirror holds the truth; nothing to copy in)
+            st_sync_gpu_only++;
+            cap_entry_set(page, {gpu_page_gen(page), 0, true});   // (GPU-origin mark for Phase 2; readers skip e.gpu)
+            page++;
+            continue;
         }
         if (dirty && protect_bare_on() && prot_page_since(page, p.synced_gen)) {   // (the GPU's records kept: see prot_pages)
             st_prot_kept++;
@@ -2327,7 +2466,7 @@ void mirror_sync(Pool& p) {
         }
         if (dirty && !sync_live()) {   // (as a capture took it, if the page was not written since)
             const CapEntry e = cap_entry(page);
-            if (e.gen && e.gen == pg) {
+            if (!e.gpu && e.gen && e.gen == pg) {   // (GPU-origin marks hold no copy)
                 auto b = cap_bufs.find(e.gen);
                 if (b != cap_bufs.end()) {
                     const uint64_t ga = std::max(page << kPageShift, p.lo), gb = std::min((page + 1) << kPageShift, p.hi);
@@ -2420,6 +2559,9 @@ struct RbSegments {
 void rb_hazard_locked(uint64_t lo, uint64_t hi) {   // (pools_mu held)
     if (rb_hazards_epoch != mirror_epoch) rb_hazards.clear(), rb_hazards_epoch = mirror_epoch;
     rb_hazards.push_back({lo, hi, texture_segment()});
+    // (dirty-origin: every range bound for GPU write stamps gpu_gen, which mirror_sync and the write-back's end read.
+    // Idempotent with memory_stamp_gpu's stamp of the same bind: same submission, same gpu_now)
+    if (dirty_origin_on() && hi > lo) stamp_gpu_range(lo, hi - lo);
 }
 }
 void memory_note_readback(uint64_t guest, uint64_t size) {
@@ -2747,15 +2889,30 @@ BufferRef gpu_buffer_bind(uint64_t gpu, uint64_t size, bool written) {
         // back was most of a submit's memory sync (issue 384: 68 MB a frame, 7 ms of the GPU's time, and
         // RX_VK_NO_WRITEBACK took an RTX 4080 from 45 to 57 fps). Small results the CPU does read (the exposure
         // meter and the like) stay copied. 0 or unset: every written binding, as before.
+        // (dirty-origin, Phase 1: the gate stays the coarse one, but a large binding the CPU also reads (both-dirty:
+        // a page the CPU wrote since the pool's sync, or GPU results the CPU read back before) still queues; the
+        // end narrows it to the CPU-touched subranges instead of copying it whole. GPU-dirty-only bulk keeps the skip)
         static const uint64_t wb_max = [] {
             const char* e = getenv("RX_VK_WB_MAX_KB");
             const uint64_t kb = e ? (uint64_t)std::max(0, atoi(e)) : 0;
             if (kb) logf("vk: write-backs only of written bindings up to %llu KB (RX_VK_WB_MAX_KB)", (unsigned long long)kb);
             return kb << 10;
         }();
+        const uint64_t wend = std::min(off + size, p->hi - p->lo);
         if (!wb_max || size <= wb_max)
-            writebacks.push_back({p, off, std::min(off + size, p->hi - p->lo)});
-        rb_hazard_locked(p->lo + off, p->lo + std::min(off + size, p->hi - p->lo));   // (memory_rb_refresh)
+            writebacks.push_back({p, off, wend});
+        else if (!dirty_origin_on() || wend <= off)
+            st_wb_large_skipped++;   // (off: #1629's skip stands unmodified; wend <= off cannot queue)
+        else {
+            bool ever = false;
+            memory_writeback_value(p->lo + off, wend - off, &ever);   // (pools_mu held; wb_pages_mu is the leaf: see note_direct_write)
+            if (ever || memory_written_since(p->lo + off, wend - off, p->synced_gen)) {
+                writebacks.push_back({p, off, wend});
+                st_wb_large_kept++;
+            } else
+                st_wb_large_skipped++;
+        }
+        rb_hazard_locked(p->lo + off, p->lo + wend);   // (memory_rb_refresh)
     }
     return remember({p->mirror, off, size, 0});
 }
@@ -2968,6 +3125,7 @@ void memory_begin_submission() {
     reap_mirrors();
     retired_imports_give_back();
     mirror_epoch++;
+    gpu_now++;   // (dirty-origin: this submission's GPU stamps; Pool::gpu_synced is set from it at the end)
     mirror_upload = true;
     mirror_synced.clear();
     writebacks.clear();
@@ -3111,7 +3269,7 @@ bool mirror_make(Pool& pool) {
             std::map<VkBuffer, std::vector<VkBufferCopy>> over;
             for (uint64_t page = p->lo >> kPageShift; page < (p->hi + 4095) >> kPageShift; page++) {
                 const CapEntry e = cap_entry(page);
-                if (!e.gen || e.gen != page_gen(page)) continue;
+                if (e.gpu || !e.gen || e.gen != page_gen(page)) continue;   // (GPU-origin marks hold no copy)
                 auto b = cap_bufs.find(e.gen);
                 if (b == cap_bufs.end()) continue;
                 const uint64_t ga = std::max(page << kPageShift, p->lo), gb = std::min((page + 1) << kPageShift, p->hi);
@@ -3134,6 +3292,7 @@ bool mirror_make(Pool& pool) {
         p->mstate = Pool::MIRROR_ON;
         pools_gen.fetch_add(1, std::memory_order_relaxed);   // (the binding's buffer changes: guest memory, then this mirror)
         p->synced_gen = gen_now;
+        p->gpu_synced = gpu_now;   // (dirty-origin: nothing of either side outstanding at the make)
         p->synced_epoch = mirror_epoch;
         p->sync_seg = texture_segment();
         mirror_synced.push_back(p);
@@ -3182,6 +3341,7 @@ struct DeadShadow {
 std::deque<DeadShadow> dead_shadows;
 uint64_t shadow_bytes = 0;
 int64_t st_wbd_runs = 0, st_wbd_bytes = 0, st_wbd_fill_pages = 0;
+int64_t st_wb_large_kept = 0, st_wb_large_skipped = 0;   // (dirty-origin: #1629's oversize gate kept / skipped)
 bool wb_diff_on() {
     // (hookshot) On by default again (v2.0.11). v2.0.9 turned it off with the presents' own queue after the device lost on an RTX 4090
     // with NVIDIA's 621 driver (issue 1161); the reporter's A/B then put that on the present queue (black screen with it alone), and the
@@ -3392,6 +3552,15 @@ void guest_cpu_wrote(uint64_t gpu, uint64_t n) {
 }
 // A run of a pool (offsets, in whole words) as the pass's chunks, in order: the words before its first 16-byte vector, the
 // vectors 64 KB at most at a time, the words after the last; emit(offset, bytes, vectors). (tests/test_wb_diff_split.py)
+// (dirty-origin: whether a page of a run reaches the pass at all is wbd_keep_page: unknown-to-shadow pages, GPU-dirty
+// ones and write-back-pending ones are kept, the rest culled. Pure: cut by tests/test_wb_diff_split.py)
+// (Phase 1 expectation, accepted: queued runs are stamped whole at bind, so nearly every page of them is unknown or
+// GPU-dirty or pending, and the cull keeps nearly all of them — compared bytes barely shrink. The savings are
+// Phase 2's job (a GPU kernel diffing against the shadow). This half only classifies; do not "optimize" it into
+// shrinking compared bytes, and do not read a flat compared-bytes line as a Phase 1 result)
+inline bool wbd_keep_page(bool known, bool gpu_dirty, bool pending) {
+    return pending || !known || gpu_dirty;
+}
 template <class F> void wbd_split(uint64_t at, uint64_t size, F&& emit) {
     const uint64_t end = at + size;
     const uint64_t body = std::min<uint64_t>(end, (at + 15) & ~(uint64_t)15), body_end = std::max<uint64_t>(body, end & ~(uint64_t)15);
@@ -3450,17 +3619,23 @@ void memory_end_submission(VkCommandBuffer cmd) {
             static int64_t l_old;
             logf("vk: mirror syncs (600 submits): %lld dirty pages from their submits' captures, %lld from earlier ones', "
                  "%lld from guest memory as it was at the replay; %zu captures kept; %lld pages the GPU wrote copied over "
-                 "(%lld live); %lld kept for the GPU (RX_VK_PROTECT_BARE)", (long long)(st_sync_cap_pages - l_cap),
+                 "(%lld live); %lld kept for the GPU (RX_VK_PROTECT_BARE); %lld GPU-dirty-only skipped (the mirror holds them)",
+                 (long long)(st_sync_cap_pages - l_cap),
                  (long long)(st_sync_old_pages - l_old), (long long)(st_sync_live_pages - l_live), cap_bufs.size(),
-                 (long long)st_sync_gpu_pages, (long long)st_sync_gpu_live, (long long)st_prot_kept.load());
+                 (long long)st_sync_gpu_pages, (long long)st_sync_gpu_live, (long long)st_prot_kept.load(),
+                 (long long)st_sync_gpu_only);
             l_cap = st_sync_cap_pages, l_live = st_sync_live_pages, l_old = st_sync_old_pages;
+            st_sync_gpu_only = 0;
             if (shadow_bytes || st_wbd_runs)
                 logf("vk: write-back diff (600 submits): %lld runs, %.1f MB compared; %lld pages read into the shadows; %llu MB of shadows; "
-                     "pages the shadows knew that the CPU wrote: %lld in captures, %lld only in the collection, %lld only by the replay itself",
+                     "pages the shadows knew that the CPU wrote: %lld in captures, %lld only in the collection, %lld only by the replay itself; "
+                     "large bindings kept %lld / skipped %lld (RX_VK_WB_MAX_KB), capture ranges pruned %lld",
                      (long long)st_wbd_runs, st_wbd_bytes / 1048576.0, (long long)st_wbd_fill_pages, (unsigned long long)(shadow_bytes >> 20),
-                     (long long)st_wbd_known_game, (long long)st_wbd_known_collected, (long long)st_wbd_known_replay);
+                     (long long)st_wbd_known_game, (long long)st_wbd_known_collected, (long long)st_wbd_known_replay,
+                     (long long)st_wb_large_kept, (long long)st_wb_large_skipped, (long long)st_cap_pruned);
             st_wbd_runs = st_wbd_bytes = st_wbd_fill_pages = 0;
             st_wbd_known_game = st_wbd_known_collected = st_wbd_known_replay = 0;
+            st_wb_large_kept = st_wb_large_skipped = st_cap_pruned = 0;
             std::vector<std::pair<int64_t, uint64_t>> top;
             for (const auto& [lo, k] : live_by_pool) top.push_back({k, lo});
             std::sort(top.rbegin(), top.rend());
@@ -3525,6 +3700,22 @@ void memory_end_submission(VkCommandBuffer cmd) {
         static thread_local std::vector<VkBufferCopy> fills, odd;
         chunks.clear(), chunk_src.clear();
         bool filled = false;
+        // (dirty-origin: the pages with a write-back still in flight (their value past the GPU's progress): the cull
+        // below never drops them (readback ordering: vk_replay.cpp invalidate waits on their value for the bytes).
+        // One wb_pages_mu acquisition for the whole end; the note loop below takes it again per run, as before)
+        std::vector<uint32_t> wb_pending_pages;
+        if (dirty_origin_on()) {   // (off: left empty, and the cull below is skipped: the whole copies, as before)
+            std::lock_guard wlk(wb_pages_mu);
+            if (!wb_pages.empty())
+                for (const WriteBack& w : writebacks) {
+                    const uint64_t glo = w.pool->lo + w.lo, ghi = w.pool->lo + w.hi;
+                    if (ghi <= glo) continue;
+                    for (uint64_t pg = glo >> kPageShift; pg <= (ghi - 1) >> kPageShift && pg < kPages; pg++)
+                        if (wb_pages.get(pg) > mem_completed) wb_pending_pages.push_back((uint32_t)pg);
+                }
+            std::sort(wb_pending_pages.begin(), wb_pending_pages.end());
+            wb_pending_pages.erase(std::unique(wb_pending_pages.begin(), wb_pending_pages.end()), wb_pending_pages.end());
+        }
         for (size_t i = 0; i < writebacks.size();) {
             Pool* p = writebacks[i].pool;
             runs.clear();
@@ -3542,6 +3733,32 @@ void memory_end_submission(VkCommandBuffer cmd) {
             for (const VkBufferCopy& r : runs) run_bytes += r.size;
             if (diff && !p->shadow && run_bytes >= (256u << 10)) shadow_make(*p);   // (a pool whose write-back is worth one, as VRAM allows)
             if (diff && p->shadow && p->address && p->mirror) {
+                // (dirty-origin: the merged runs intersected with (unknown-to-shadow pages ∪ GPU-dirty set) before
+                // chunking. #1629's exception queues large both-dirty bindings whole; the cull narrows them to the
+                // pages the pass must compare. Pending pages above are never culled (wbd_keep_page))
+                if (dirty_origin_on()) {   // (off: runs copy whole, as before)
+                    std::vector<VkBufferCopy> kept;
+                    for (const VkBufferCopy& r : runs) {
+                        const uint64_t r_end = r.dstOffset + r.size;
+                        for (uint64_t pi = r.dstOffset >> kPageShift; (pi << kPageShift) < r_end; pi++) {
+                            const uint64_t at = std::max(pi << kPageShift, r.dstOffset),
+                                           end = std::min((pi + 1) << kPageShift, r_end);
+                            const uint64_t gpg = (p->lo >> kPageShift) + pi;   // (imports are page-aligned: align >= 4096)
+                            const bool known = pi < (uint64_t)p->shadow_known.size() * 64 &&
+                                               ((p->shadow_known[pi >> 6] >> (pi & 63)) & 1ull);
+                            const bool keep = wbd_keep_page(
+                                known, gpg < kPages && gpu_page_gen(gpg) > p->gpu_synced,
+                                std::binary_search(wb_pending_pages.begin(), wb_pending_pages.end(), (uint32_t)gpg));
+                            if (!keep) continue;
+                            if (!kept.empty() && kept.back().srcOffset + kept.back().size == at)
+                                kept.back().size = end - kept.back().srcOffset;
+                            else
+                                kept.push_back({at, at, end - at});
+                        }
+                    }
+                    runs.swap(kept);
+                }
+                if (runs.empty()) continue;
                 VkBufferDeviceAddressInfo mda{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
                 mda.buffer = p->mirror;
                 const VkDeviceAddress mirror_address = vkGetBufferDeviceAddress(dev.device, &mda);
@@ -3580,7 +3797,8 @@ void memory_end_submission(VkCommandBuffer cmd) {
                         chunk_src.push_back({p, at, len});
                     });
                 }
-                st_wbd_runs += (int64_t)runs.size(), st_wbd_bytes += (int64_t)run_bytes;
+                st_wbd_runs += (int64_t)runs.size();
+                for (const VkBufferCopy& r : runs) st_wbd_bytes += (int64_t)r.size;   // (culled runs: what the pass compares)
             } else {
                 vkCmdCopyBuffer(cmd, p->mirror, p->buffer, (uint32_t)runs.size(), runs.data());
             }
@@ -3642,7 +3860,7 @@ void memory_end_submission(VkCommandBuffer cmd) {
     }
     // (what this submission synced is current as of now: the GPU's own writes, stamped while it was recorded, are
     // in the mirror and written back; CPU writes collected at the next submission get a newer generation)
-    for (Pool* p : mirror_synced) p->synced_gen = gen_now;
+    for (Pool* p : mirror_synced) p->synced_gen = gen_now, p->gpu_synced = gpu_now;
     mirror_synced.clear();
     mirror_upload = false;
 }

@@ -65,6 +65,18 @@ void memory_table_begin() {}
 bool memory_table_flush() { return false; }
 void memory_protect_gpu(uint64_t, uint64_t) {}
 bool slow_desc_timing() { return false; }
+// (dirty-origin scaffolding for the cut bind tail and rb_hazard_locked: the oversize write-back gate (RX_VK_WB_MAX_KB
+// unset here, so wb_max is 0 and the gate short-circuits) is not modelled — the cases bind 16 bytes, which always
+// take the first branch; the split reads on by default. stamp_gpu_range does run, as a no-op, through the real
+// rb_hazard_locked cut; the other stubs only satisfy the compiler)
+static bool dirty_origin_on() { return true; }
+static void stamp_gpu_range(uint64_t, uint64_t) {}
+static bool memory_written_since(uint64_t, uint64_t, uint32_t) { return false; }
+static uint64_t memory_writeback_value(uint64_t, uint64_t, bool* ever) {
+    if (ever) *ever = false;
+    return 0;
+}
+static int64_t st_wb_large_kept = 0, st_wb_large_skipped = 0;
 uint64_t texture_segment();
 void memory_rb_recording_begun();
 void memory_rb_segments_begin(uint64_t base, uint64_t n);

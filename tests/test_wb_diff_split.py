@@ -1,6 +1,8 @@
 """CPU check of the write-back diff's chunks (gpu/vk/vk_memory.cpp wbd_split): a run in whole words comes out as its words
 before the first 16-byte vector, the vectors 64 KB at most at a time, and the words after the last vector, covering the run
-exactly once and in order, every vector chunk 16-byte aligned and whole.
+exactly once and in order, every vector chunk 16-byte aligned and whole. Also the dirty-origin predicates (Phase 1):
+wbd_keep_page (the end culls to unknown-to-shadow pages, GPU-dirty ones and pending ones) and dirty_origin_of
+(0 clean, 1 CPU-only, 2 GPU-only, 3 both).
 
 python -I -B tests/test_wb_diff_split.py [--cxx clang++]
 """
@@ -31,6 +33,8 @@ def main():
     args = parser.parse_args()
     text = args.source.read_text(encoding='utf-8')
     helper = block(text, 'template <class F> void wbd_split(')
+    keep = block(text, 'inline bool wbd_keep_page(')
+    origin = block(text, 'inline uint8_t dirty_origin_of(')
     fixture = r'''
 #include <algorithm>
 #include <cstdint>
@@ -39,7 +43,7 @@ def main():
 #define CHECK(ok) do { if (!(ok)) { std::fprintf(stderr, "failed: %s (at %llu size %llu)\n", #ok, \
     (unsigned long long)at0, (unsigned long long)size0); std::exit(1); } } while (0)
 static uint64_t at0, size0;
-''' + helper + r'''
+''' + helper + keep + origin + r'''
 static void check(uint64_t at, uint64_t size) {
     at0 = at, size0 = size;
     uint64_t next = at, vec_bytes = 0;
@@ -71,7 +75,19 @@ int main() {
     for (uint64_t at = 0; at < 32; at += 4)
         for (uint64_t size : {65532ull, 65536ull, 65540ull, 65552ull, 131072ull, 131084ull, (64ull << 20) + 12})
             check(0x40000 + at, size);
-    std::puts("PASS: write-back diff chunks cover each run once, in order, vectors aligned and at most 64 KB");
+    // (dirty-origin, Phase 1: the end keeps unknown-to-shadow pages, GPU-dirty ones and pending ones, culls the rest)
+    CHECK(wbd_keep_page(false, false, false) && wbd_keep_page(false, false, true));
+    CHECK(wbd_keep_page(false, true, false) && wbd_keep_page(false, true, true));
+    CHECK(!wbd_keep_page(true, false, false));
+    CHECK(wbd_keep_page(true, false, true) && wbd_keep_page(true, true, false) && wbd_keep_page(true, true, true));
+    // (dirty origins: 0 clean, 1 CPU-only, 2 GPU-only, 3 both; stamped exactly at the sync is already mirrored)
+    CHECK(dirty_origin_of(0, 0, 0, 0) == 0);
+    CHECK(dirty_origin_of(5, 0, 4, 9) == 1 && dirty_origin_of(5, 3, 4, 9) == 1);
+    CHECK(dirty_origin_of(4, 10, 4, 9) == 2 && dirty_origin_of(0, 10, 0, 9) == 2);
+    CHECK(dirty_origin_of(5, 10, 4, 9) == 3);
+    CHECK(dirty_origin_of(4, 9, 4, 9) == 0);
+    std::puts("PASS: write-back diff chunks cover each run once, in order, vectors aligned and at most 64 KB; "
+        "the cull keeps unknown, GPU-dirty and pending pages; origins classify clean/CPU/GPU/both");
 }
 '''
     with tempfile.TemporaryDirectory() as tmp:
