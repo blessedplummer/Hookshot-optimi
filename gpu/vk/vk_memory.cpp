@@ -81,6 +81,7 @@ struct Pool {
     VmaAllocation shadow_alloc = nullptr;
     VkDeviceAddress shadow_address = 0;
     std::vector<uint64_t> shadow_known;   // (a bit a page)
+    bool shadow_inherit_pending = false;  // (Phase 2: retired with a shadow worth inheriting: kept until the next mirror takes it)
 };
 uint64_t mem_rec_value = 0, mem_completed = 0;   // (the recording being made, and the GPU's progress)
 
@@ -678,6 +679,8 @@ inline uint8_t dirty_origin_of(uint32_t cpu, uint32_t gpu, uint32_t cpu_synced, 
 // (dirty-origin kill switch: RX_VK_DIRTY_ORIGIN=0 restores the pre-split paths (page_gen for all writes, no sync
 // skip, #1629's gate unmodified, no scan prune, no end cull). Default on. Read once; the baselines and counters keep
 // advancing while off, but nothing reads them. tests/test_wb_diff_cpu_writes.py)
+// (Phase 2, MiMo: the same switch disables every Phase-2 path below (tile mask, sparse mirrors, shadow inherit,
+// largest-first eviction). Each site reads dirty_origin_on() explicitly; tests/test_wb_phase2_tiles.py checks it)
 bool dirty_origin_on() {
     static const bool on = [] {
         const char* e = getenv("RX_VK_DIRTY_ORIGIN");
@@ -687,6 +690,87 @@ bool dirty_origin_on() {
     }();
     return on;
 }
+// ---- Phase 2: sparse mirrors, shadow inherit, biased eviction ----
+// Pure helpers: cut by tests/test_wb_phase2_tiles.py.
+// Pools over threshold (a 4K surface: 3840x2160x4 ~ 32 MB) avoid the full n-byte mirror_make copy: the mirror is
+// filled from the footprints the submission already knows (retired-mirror inherit, capture overlay, CPU-dirty live
+// runs) plus a bounded tail fill from guest memory for whatever those leave uncovered. When the uncovered extent is
+// large (a fresh pool first-bound for READ, a big realloc growth tail, a read-mostly pool: none of inherit/capture/
+// CPU-dirt cover it) the code falls back to the full copy instead of many small fills. Either way every byte of the
+// new mirror is written before the page table points at it: no uninitialized reads. Off (kill switch): full copy.
+// (Correction of an earlier comment that had this backwards: sync/capture/dirty cover exactly the FILLED pages;
+// the decision below pins what happens to the rest.)
+constexpr uint64_t kSparseMirrorThreshold = 32u << 20;
+inline bool mirror_sparse_for(uint64_t pool_bytes) { return pool_bytes > kSparseMirrorThreshold; }
+// The tail fill from guest memory is bounded: past this many uncovered bytes, one full copy is cheaper and simpler
+// than dozens of small fills (and for a fresh READ pool the uncovered extent is the whole pool anyway).
+constexpr uint64_t kSparseTailMax = 8u << 20;
+// Sorted, merged, clipped [lo, hi) byte runs. Pure.
+inline std::vector<std::pair<uint64_t, uint64_t>> runs_normalize(std::vector<std::pair<uint64_t, uint64_t>> v) {
+    std::sort(v.begin(), v.end());
+    std::vector<std::pair<uint64_t, uint64_t>> m;
+    for (const auto& r : v) {
+        if (r.second <= r.first) continue;
+        if (!m.empty() && r.first <= m.back().second)
+            m.back().second = std::max(m.back().second, r.second);
+        else
+            m.push_back(r);
+    }
+    return m;
+}
+// Complement of the covered runs within [base, base + size). Pure: the sparse decision's uncovered extent.
+inline std::vector<std::pair<uint64_t, uint64_t>> runs_uncovered(uint64_t base, uint64_t size,
+                                                                 const std::vector<std::pair<uint64_t, uint64_t>>& covered) {
+    std::vector<std::pair<uint64_t, uint64_t>> out;
+    uint64_t at = base;
+    for (const auto& r : covered) {
+        const uint64_t lo = std::max(r.first, base), hi = std::min(r.second, base + size);
+        if (hi <= lo) continue;
+        if (lo > at) out.push_back({at, lo});
+        at = std::max(at, hi);
+    }
+    if (at < base + size) out.push_back({at, base + size});
+    return out;
+}
+inline uint64_t runs_bytes(const std::vector<std::pair<uint64_t, uint64_t>>& v) {
+    uint64_t n = 0;
+    for (const auto& r : v) n += r.second - r.first;
+    return n;
+}
+// True: the uncovered extent is small enough to fill from guest memory with a few copies. False: fall back to the
+// full n-byte copy (fresh READ pools land here: uncovered == the whole pool).
+inline bool sparse_tail_ok(uint64_t uncovered_bytes) { return uncovered_bytes <= kSparseTailMax; }
+// Shadow inherit across reallocs (like retired-mirror inherit): a new shadow takes the old shadow's known pages
+// where NEITHER side wrote since the retired pool's last sync: CPU dirt (page_gen <= synced, or a bare-entry page
+// the mirror kept) AND GPU dirt (gpu_gen <= gpu_synced). The GPU term matters because the retired shadow holds
+// guest-side truth, which a post-sync GPU write made stale; that page's truth lives in the retired MIRROR, and it
+// reaches the new mirror through the mirror-inherit path (same submission, same rule shape), never through the
+// shadow. Inheriting it into the new shadow would pin the stale word as "known". Pure predicate; the copies
+// themselves are GPU copies in shadow_inherit_copy.
+inline bool shadow_inherit_keep(uint32_t cpu_gen, uint32_t synced, bool prot_kept, uint32_t gpu_gen,
+                                uint32_t gpu_synced) {
+    return (cpu_gen <= synced || prot_kept) && gpu_gen <= gpu_synced;
+}
+// Budget bias: evict-largest-first under pressure, protecting small constant pools (no L1 PCIe cliff).
+// Small pools (uniforms, constants) stay mirrored: evicting them saves little and puts every draw back on PCIe.
+// Pure ordering helper: pressured sorts largest-first; idle sorts stalest-first. last_value breaks remaining ties
+// so the order is deterministic for a fixed input (it is otherwise unused by the comparator's first keys).
+constexpr uint64_t kSmallPoolProtect = 1u << 20;
+struct EvictCand { uint64_t lo = 0, bytes = 0, synced_epoch = 0, last_value = 0; };
+inline void sort_evict_candidates(std::vector<EvictCand>& v, bool pressured) {
+    if (pressured)
+        std::sort(v.begin(), v.end(), [](const EvictCand& a, const EvictCand& b) {
+            if (a.bytes != b.bytes) return a.bytes > b.bytes;
+            if (a.synced_epoch != b.synced_epoch) return a.synced_epoch < b.synced_epoch;
+            return a.last_value < b.last_value;
+        });
+    else
+        std::sort(v.begin(), v.end(), [](const EvictCand& a, const EvictCand& b) {
+            if (a.synced_epoch != b.synced_epoch) return a.synced_epoch < b.synced_epoch;
+            return a.last_value < b.last_value;
+        });
+}
+inline bool evict_protect_small(uint64_t pool_bytes) { return pool_bytes < kSmallPoolProtect; }
 } // namespace
 
 namespace { void cap_view_bump(); }   // (defined with cap_view_gen below, in this file's anonymous namespace)
@@ -2370,7 +2454,13 @@ std::deque<std::map<uint64_t, Pool>::node_type> retired_pools;
 
 void retire_pool(std::map<uint64_t, Pool>::iterator it) {
     Pool* old = &it->second;
-    shadow_free(*old);   // (its write-backs in this submission, if any, copied whole)
+    // (Phase 2, MiMo: shadows inherited across reallocs like retired-mirror inherit. A retired pool with a shadow
+    // worth keeping leaves it for the pool that takes it in (mirror_make's shadow inherit); otherwise freed, and its
+    // write-backs in this submission, if any, copied whole. Gated by the kill switch: off frees, as before)
+    if (dirty_origin_on() && old->shadow && (old->mstate == Pool::MIRROR_ON || old->was_mirrored))
+        old->shadow_inherit_pending = true;
+    else
+        shadow_free(*old);   // (its write-backs in this submission, if any, copied whole)
     guest_pages_set(old->lo, old->hi, 0);
     old->retired_value = std::max(old->last_value, mem_rec_value);
     std::erase(mirror_wanted, old);   // (the new pool gets the mirror)
@@ -3018,13 +3108,43 @@ void mirrors_give_back(uint64_t want_bytes) {   // (pools_mu held)
         Pool& p = nh.mapped();
         // (EvilOOT: kept while the pool that took it in has not made its mirror, for 600 submissions at most)
         if (p.inherit_pending && mirror_epoch - p.retired_epoch > kIdleEpochs) p.inherit_pending = false;
+        if (p.shadow_inherit_pending && mirror_epoch - p.retired_epoch > kIdleEpochs) p.shadow_inherit_pending = false;
         if (p.mstate == Pool::MIRROR_ON && p.retired_value <= mem_completed && !p.inherit_pending) mirror_free(p);
     }
     std::vector<Pool*> idle;
     for (auto& [lo, p] : imported)
         if (p.mstate == Pool::MIRROR_ON && mirror_epoch - p.synced_epoch > kIdleEpochs && p.last_value <= mem_completed)
             idle.push_back(&p);
-    std::sort(idle.begin(), idle.end(), [](const Pool* a, const Pool* b) { return a->synced_epoch < b->synced_epoch; });
+    // (Phase 2, MiMo: budget bias. Under pressure (mirrors over budget) evict-largest-first via the pure helper,
+    // protecting small constant pools (no L1 PCIe cliff): pools under kSmallPoolProtect stay unless long idle.
+    // Off: stalest-first, as before. Idle expiry beyond kLongIdle is unchanged either way. Single pass: protected
+    // pools collect into `held` and rejoin after the biased list (still evictable below past kLongIdle), so no
+    // O(n^2) re-scan of the biased list.)
+    auto resolve = [&](bool pressured) {
+        std::vector<EvictCand> order;
+        order.reserve(idle.size());
+        for (Pool* q : idle) order.push_back({q->lo, q->hi - q->lo, q->synced_epoch, q->last_value});
+        sort_evict_candidates(order, pressured);   // (pure: tests/test_wb_phase2_tiles.py)
+        std::vector<Pool*> out, held;
+        out.reserve(idle.size());
+        held.reserve(idle.size());
+        for (const EvictCand& c : order) {
+            auto it = imported.find(c.lo);
+            if (it == imported.end()) continue;
+            Pool* q = &it->second;
+            if (pressured && evict_protect_small(q->hi - q->lo) && mirror_epoch - q->synced_epoch <= kLongIdle)
+                held.push_back(q);   // (small and recently used: evict last)
+            else
+                out.push_back(q);
+        }
+        out.insert(out.end(), held.begin(), held.end());
+        idle.swap(out);
+    };
+    if (dirty_origin_on() && mirror_bytes + want_bytes > mirror_budget())
+        resolve(true);   // (largest-first under pressure)
+    else
+        resolve(false);   // (stalest-first, as before)
+
     for (Pool* p : idle)
         if (mirror_epoch - p->synced_epoch > kLongIdle || mirror_bytes + want_bytes > mirror_budget()) mirror_free(*p);
     static int64_t logged_at;
@@ -3199,11 +3319,77 @@ bool mirror_make(Pool& pool) {
                 logf("vk: addr mirror %#llx..%#llx at gpu %#llx..%#llx", (unsigned long long)p->lo, (unsigned long long)p->hi,
                      (unsigned long long)ma, (unsigned long long)(ma + n));
         }
-        const VkBufferCopy all{0, 0, n};
-        {
-            GprofSpan gp(upload_command_buffer(), "mmake copy (a whole pool -> its new mirror)");
-            gp.bytes = n;
-            vkCmdCopyBuffer(upload_command_buffer(), p->buffer, p->mirror, 1, &all);   // (all of it, at this generation)
+        // (Phase 2, MiMo: bound the one-time leg. Pools over threshold (4K surfaces) skip the full n-byte
+        // mirror_make copy when their footprints already cover (almost) everything: the fill is CPU-dirty live runs
+        // plus a bounded tail fill from guest memory for whatever those and the capture overlay leave uncovered,
+        // then inherit (retired mirrors) and the capture overlay overwrite with newer truth. When the uncovered
+        // extent is large (a fresh pool first-bound for READ, a big realloc growth tail, a read-mostly pool) the
+        // code falls back to the full copy: every byte of the new mirror is written before the page table points at
+        // it, so shader reads never see uninitialized VRAM (VMA device-local allocs are not zeroed). Off (kill
+        // switch): full copy, as before.
+        // (An earlier comment had the coverage backwards: sync/capture/dirty cover exactly the FILLED pages; the
+        // decision below pins the fate of the rest. tests/test_wb_phase2_tiles.py executes it: a fresh READ falls
+        // back to the full copy, a covered pool stays sparse, a small tail fills bounded.)
+        bool sparse = dirty_origin_on() && mirror_sparse_for(n);
+        std::vector<VkBufferCopy> tail_fill;
+        uint64_t sparse_dirty_bytes = 0, sparse_tail_bytes = 0;
+        if (sparse) {
+            // (coverage preview: CPU-dirty-ever runs plus the capture overlay's dst ranges. Inherit only ADDS
+            // coverage, so leaving it out over-estimates the uncovered extent: at most an unnecessary fallback to
+            // the full copy, never a hole. The inherit below then overwrites GPU-truth pages over this fill.)
+            std::vector<std::pair<uint64_t, uint64_t>> dirty_runs;
+            memory_written_runs(p->lo, n, 0, dirty_runs);
+            std::vector<std::pair<uint64_t, uint64_t>> cover = dirty_runs;
+            for (uint64_t page = p->lo >> kPageShift; page < (p->hi + 4095) >> kPageShift; page++) {
+                const CapEntry e = cap_entry(page);
+                if (e.gpu || !e.gen || e.gen != page_gen(page)) continue;
+                if (cap_bufs.find(e.gen) == cap_bufs.end()) continue;
+                const uint64_t ga = std::max(page << kPageShift, p->lo), gb = std::min((page + 1) << kPageShift, p->hi);
+                cover.push_back({ga - p->lo, gb - p->lo});
+            }
+            const std::vector<std::pair<uint64_t, uint64_t>> uncovered =
+                runs_uncovered(0, n, runs_normalize(std::move(cover)));
+            const uint64_t uncovered_bytes = runs_bytes(uncovered);
+            if (!sparse_tail_ok(uncovered_bytes)) {
+                sparse = false;   // (fresh READ / big tail / read-mostly: one full copy, as before)
+                static int logged_fallback;
+                if (logged_fallback++ < 8)
+                    logf("vk: pool %#llx (%llu MB): sparse fallback (%.1f MB uncovered): full copy",
+                         (unsigned long long)p->lo, (unsigned long long)(n >> 20), uncovered_bytes / 1048576.0);
+            } else {
+                for (const auto& r : uncovered) {
+                    tail_fill.push_back({r.first, r.first, r.second - r.first});
+                    sparse_tail_bytes += r.second - r.first;
+                }
+                for (const auto& r : dirty_runs) sparse_dirty_bytes += r.second - r.first;
+            }
+        }
+        if (!sparse) {
+            const VkBufferCopy all{0, 0, n};
+            {
+                GprofSpan gp(upload_command_buffer(), "mmake copy (a whole pool -> its new mirror)");
+                gp.bytes = n;
+                vkCmdCopyBuffer(upload_command_buffer(), p->buffer, p->mirror, 1, &all);   // (all of it, at this generation)
+            }
+        } else {
+            // (sparse fill: the pool's CPU-dirty runs plus the bounded tail fill, both from guest memory now;
+            // inherit + capture follow and overwrite with newer truth)
+            std::vector<std::pair<uint64_t, uint64_t>> dirty_runs;
+            memory_written_runs(p->lo, n, 0, dirty_runs);
+            std::vector<VkBufferCopy> sparse_runs;
+            for (const auto& r : dirty_runs) sparse_runs.push_back({r.first, r.first, r.second - r.first});
+            sparse_runs.insert(sparse_runs.end(), tail_fill.begin(), tail_fill.end());
+            if (!sparse_runs.empty()) {
+                GprofSpan gp(upload_command_buffer(), "mmake sparse (dirty + bounded tail -> new mirror)");
+                for (const VkBufferCopy& r : sparse_runs) gp.bytes += r.size, st_sync_bytes += (int64_t)r.size;
+                vkCmdCopyBuffer(upload_command_buffer(), p->buffer, p->mirror, (uint32_t)sparse_runs.size(),
+                                sparse_runs.data());
+            }
+            static int logged_sparse;
+            if (logged_sparse++ < 8)
+                logf("vk: pool %#llx (%llu MB): mirror made sparse (%.1f MB dirty, %.1f MB tail, no full copy)",
+                     (unsigned long long)p->lo, (unsigned long long)(n >> 20),
+                     sparse_dirty_bytes / 1048576.0, sparse_tail_bytes / 1048576.0);
         }
         {   // (EvilOOT) then the mirrors of the pools it took in, over their part: what the GPU wrote there and only there
             // (retire_pool). The captures' pages go over it after, as before: the CPU's newer writes win
@@ -3212,7 +3398,7 @@ bool mirror_make(Pool& pool) {
             for (auto& nh : retired_pools) {
                 Pool& r = nh.mapped();
                 if (!r.inherit_pending || r.mstate != Pool::MIRROR_ON || !r.mirror || r.hi <= p->lo || r.lo >= p->hi) continue;
-                if (!barrier_done) {   // (after the full copy, and after the shaders of earlier submissions wrote the old mirror)
+                if (!barrier_done) {   // (after the fill above, and after the shaders of earlier submissions wrote the old mirror)
                     VkMemoryBarrier2 mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
                     mb.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
                     mb.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT;
@@ -3277,7 +3463,7 @@ bool mirror_make(Pool& pool) {
                 b->second.last_use = std::max(b->second.last_use, mem_rec_value);
             }
             if (!over.empty()) {
-                VkMemoryBarrier2 mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};   // (after the full copy)
+                VkMemoryBarrier2 mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};   // (after the fill above)
                 mb.srcStageMask = mb.dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
                 mb.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
                 mb.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
@@ -3298,7 +3484,7 @@ bool mirror_make(Pool& pool) {
         mirror_synced.push_back(p);
         mirror_bytes += n;
         st_mirrors++;
-        st_sync_bytes += (int64_t)n;
+        if (!sparse) st_sync_bytes += (int64_t)n;   // (sparse: live runs counted above, inherit/capture below)
     }
     return true;
 }
@@ -3353,6 +3539,7 @@ bool wb_diff_on() {
     return on;
 }
 void shadow_free(Pool& p) {   // (pools_mu held: destroyed once the submissions so far are done)
+    p.shadow_inherit_pending = false;
     if (!p.shadow) return;
     dead_shadows.push_back({p.shadow, p.shadow_alloc, std::max(mem_rec_value, p.last_value)});
     shadow_bytes -= p.hi - p.lo;
@@ -3404,12 +3591,87 @@ bool shadow_make(Pool& p) {
     da.buffer = p.shadow;
     p.shadow_address = vkGetBufferDeviceAddress(dev.device, &da);
     p.shadow_known.assign((size_t)((n >> kPageShift) + 63) / 64, 0);
+    // (Phase 2, MiMo: shadows inherited across reallocs like retired-mirror inherit. A new shadow takes the retired
+    // shadows' known pages where neither side wrote since their last sync (shadow_inherit_keep). Off: empty, as
+    // before. The GPU copies run at the next write-back's fills; known bits are set now so the fills skip them.
+    // Coupling with mirror-inherit is deliberate: a page the GPU dirtied post-sync keeps its truth in the retired
+    // MIRROR, which the mirror-inherit path carries to the new mirror; the shadow (guest-side truth) must not claim
+    // it. Pure predicate above; the bit loop below is cut by tests/test_wb_phase2_tiles.py)
+    if (dirty_origin_on()) {
+        for (auto& nh : retired_pools) {
+            Pool& r = nh.mapped();
+            if (!r.shadow_inherit_pending || !r.shadow || r.hi <= p.lo || r.lo >= p.hi) continue;
+            const uint64_t a = std::max(r.lo, p.lo), b = std::min(r.hi, p.hi);
+            const uint32_t synced = r.synced_gen, gpu_synced = r.gpu_synced;
+            for (uint64_t g = a; g < b; g += (1ull << kPageShift)) {
+                const uint64_t page = g >> kPageShift;
+                const uint64_t si = (g - r.lo) >> kPageShift, di = (g - p.lo) >> kPageShift;
+                if ((r.shadow_known[si >> 6] & (1ull << (si & 63))) == 0) continue;
+                if (!shadow_inherit_keep(page_gen(page), synced, protect_bare_on() && prot_page_since(page, synced),
+                                         gpu_page_gen(page), gpu_synced))
+                    continue;
+                p.shadow_known[di >> 6] |= 1ull << (di & 63);
+            }
+        }
+    }
     shadow_bytes += n;
     static int logged;
     if (logged++ < 16)
         logf("vk: write-back diff: a shadow for pool %#llx (%llu MB; %llu MB of shadows)", (unsigned long long)p.lo,
              (unsigned long long)(n >> 20), (unsigned long long)(shadow_bytes >> 20));
     return true;
+}
+// (Phase 2, MiMo: after a new shadow inherits its known bits above, its contents come from the retired shadows.
+// Called at the write-back once the shadow exists; the fills that follow skip inherited pages. Off: no-op)
+void shadow_inherit_copy(Pool& dst, VkCommandBuffer cmd) {
+    if (!dirty_origin_on() || !dst.shadow) return;
+    bool barrier_done = false;
+    for (auto& nh : retired_pools) {
+        Pool& r = nh.mapped();
+        if (!r.shadow_inherit_pending || !r.shadow || r.hi <= dst.lo || r.lo >= dst.hi) continue;
+        const uint64_t a = std::max(r.lo, dst.lo), b = std::min(r.hi, dst.hi);
+        const uint32_t synced = r.synced_gen, gpu_synced = r.gpu_synced;
+        std::vector<VkBufferCopy> parts;
+        for (uint64_t g = a; g < b;) {
+            const uint64_t page = g >> kPageShift;
+            const uint64_t si = (g - r.lo) >> kPageShift, di = (g - dst.lo) >> kPageShift;
+            const bool known = (r.shadow_known[si >> 6] & (1ull << (si & 63))) != 0 &&
+                               (dst.shadow_known[di >> 6] & (1ull << (di & 63))) != 0 &&
+                               shadow_inherit_keep(page_gen(page), synced,
+                                                   protect_bare_on() && prot_page_since(page, synced),
+                                                   gpu_page_gen(page), gpu_synced);
+            if (!known) { g += (1ull << kPageShift); continue; }
+            uint64_t h = g + (1ull << kPageShift);
+            while (h < b) {
+                const uint64_t hp = h >> kPageShift, hsi = (h - r.lo) >> kPageShift, hdi = (h - dst.lo) >> kPageShift;
+                if (!((r.shadow_known[hsi >> 6] & (1ull << (hsi & 63))) &&
+                      (dst.shadow_known[hdi >> 6] & (1ull << (hdi & 63))) &&
+                      shadow_inherit_keep(page_gen(hp), synced, protect_bare_on() && prot_page_since(hp, synced),
+                                          gpu_page_gen(hp), gpu_synced)))
+                    break;
+                h += (1ull << kPageShift);
+            }
+            parts.push_back({(g - r.lo), (g - dst.lo), h - g});
+            g = h;
+        }
+        if (parts.empty()) continue;
+        if (!barrier_done) {
+            VkMemoryBarrier2 mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+            mb.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+            mb.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT;
+            mb.dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+            mb.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT;
+            VkDependencyInfo di{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+            di.memoryBarrierCount = 1, di.pMemoryBarriers = &mb;
+            vkCmdPipelineBarrier2(cmd, &di);
+            barrier_done = true;
+        }
+        vkCmdCopyBuffer(cmd, r.shadow, dst.shadow, (uint32_t)parts.size(), parts.data());
+        // (clearing on the first overlapping dst is safe: live pools are disjoint, so at most one of them overlaps
+        // a retired range — the retire-for-growth case has exactly one dst. A second dst would find no pending flag
+        // and re-derive the same known bits from the retired shadow at its own shadow_make.)
+        r.shadow_inherit_pending = false;
+    }
 }
 // (pools_mu held) every shadow given back while VRAM is really 95% full, or the driver's count at 99% (every 120 write-back
 // submissions): made again when there is room
@@ -3731,7 +3993,9 @@ void memory_end_submission(VkCommandBuffer cmd) {
             checkpoint_mark(cmd, p->lo, 'b');
             uint64_t run_bytes = 0;
             for (const VkBufferCopy& r : runs) run_bytes += r.size;
-            if (diff && !p->shadow && run_bytes >= (256u << 10)) shadow_make(*p);   // (a pool whose write-back is worth one, as VRAM allows)
+            if (diff && !p->shadow && run_bytes >= (256u << 10)) {   // (a pool whose write-back is worth one, as VRAM allows)
+                if (shadow_make(*p)) shadow_inherit_copy(*p, cmd);   // (Phase 2: retired shadows' contents over it)
+            }
             if (diff && p->shadow && p->address && p->mirror) {
                 // (dirty-origin: the merged runs intersected with (unknown-to-shadow pages ∪ GPU-dirty set) before
                 // chunking. #1629's exception queues large both-dirty bindings whole; the cull narrows them to the
@@ -3757,7 +4021,14 @@ void memory_end_submission(VkCommandBuffer cmd) {
                         }
                     }
                     runs.swap(kept);
-                }
+                    // (Phase 2, MiMo: no per-tile cull here, by decision (review 2026-11-11). A bind-time
+                    // tile mask over these same runs is a proven no-op: the marks would be set at the binds that
+                    // queue the runs and cleared after use, so marked tiles are a superset of the runs and the cull
+                    // could only drop what the Phase-1 wbd_keep_page cull above already dropped. Sourcing the mask
+                    // so the cull can bite needs GPU-observed dirt (per-tile any-differ bits from the word pass,
+                    // read back to the host) or cross-submission compared-clean stability from that signal; neither
+                    // exists on the CPU today, and a device mask filled with bind marks would mislead. The word pass
+                    // below stays the exact stage.)
                 if (runs.empty()) continue;
                 VkBufferDeviceAddressInfo mda{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
                 mda.buffer = p->mirror;
