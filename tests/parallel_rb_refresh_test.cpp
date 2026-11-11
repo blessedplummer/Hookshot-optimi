@@ -71,6 +71,7 @@ bool slow_desc_timing() { return false; }
 // rb_hazard_locked cut; the other stubs only satisfy the compiler)
 static bool dirty_origin_on() { return true; }
 static void stamp_gpu_range(uint64_t, uint64_t) {}
+static void wbd_tile_mark_range(uint64_t, uint64_t) {}   // (Phase 2: the tile-dirty prefilter's mask, not modelled here)
 static bool memory_written_since(uint64_t, uint64_t, uint32_t) { return false; }
 static uint64_t memory_writeback_value(uint64_t, uint64_t, bool* ever) {
     if (ever) *ever = false;

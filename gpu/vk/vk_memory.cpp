@@ -689,6 +689,46 @@ bool dirty_origin_on() {
 }
 } // namespace
 
+// ---- Phase 2: resolution-aware capture budget (bulk-render pools) ----
+// A pool whose write-backs cover >50% of its size for 3+ consecutive write-back submissions is a bulk-render pool:
+// framebuffer tiles and other GPU-transient storage, not game state the CPU mutates. Such pools leave the capture's
+// scans (pool_cap_ranges and cap_ranges): scanning them every submit for CPU dirt that never comes cost the capture,
+// and their contents are taken through the write-back's tile path instead (unknown-shadow fills read guest memory,
+// so nothing is lost). Small uniform/constant pools never trip this: their write-backs cover a few pages at most.
+// Pure (cut by tests/test_wb_bulk_render.py); the wiring (refresh_pool_ranges_locked, publish_cap_ranges,
+// memory_end_submission's observe) only runs while dirty_origin_on(), so RX_VK_DIRTY_ORIGIN=0 disables all of it.
+struct WbBulkHistory {
+    int consec = 0;      // (consecutive write-back submissions covering >50% of the pool)
+    bool bulk = false;   // (a bulk-render pool: out of the capture's scans, through the tile path)
+    void observe(uint64_t covered, uint64_t size) {
+        if (size && covered * 2 > size) consec++;   // (strictly over half: exactly half still counts as sparse)
+        else consec = 0;   // (a light submission, or none at all, breaks the streak)
+        bulk = consec >= 3;
+    }
+    void reset() { consec = 0; bulk = false; }
+};
+inline bool wbd_pool_excluded_from_capture(bool bulk_render, bool split_on) {
+    return split_on && bulk_render;
+}
+namespace {
+std::unordered_map<uint64_t, WbBulkHistory> wb_bulk_hist;   // (pool lo -> its write-back coverage history)
+bool wbd_pool_bulk_render(uint64_t pool_lo) {
+    const auto it = wb_bulk_hist.find(pool_lo);
+    return it != wb_bulk_hist.end() && it->second.bulk;
+}
+void wbd_pool_observe(uint64_t pool_lo, uint64_t covered, uint64_t size) {
+    if (!dirty_origin_on()) return;   // (kill switch: no bulk-render state while off)
+    if (wb_bulk_hist.size() > 4096) {   // (pools come and go: drop the idle ones, never a bulk one)
+        for (auto it = wb_bulk_hist.begin(); it != wb_bulk_hist.end();) {
+            if (!it->second.bulk && it->second.consec == 0) it = wb_bulk_hist.erase(it);
+            else ++it;
+        }
+    }
+    wb_bulk_hist[pool_lo].observe(covered, size);
+}
+void wbd_tile_mark_range(uint64_t lo, uint64_t hi);   // (Phase 2 tile prefilter, defined by the write-back's diff)
+} // namespace
+
 namespace { void cap_view_bump(); }   // (defined with cap_view_gen below, in this file's anonymous namespace)
 const std::vector<std::pair<uint64_t, uint64_t>>& capture_ranges_merged();
 void shadow_written(const uint32_t* pages, int64_t n);   // (the write-back's diff, below: pages the captures took)
@@ -1007,6 +1047,9 @@ void refresh_pool_ranges_locked() {   // (cap_ranges_mu held)
     seen.reserve((size_t)std::max(n, 0));
     for (int i = 0; i < n; i++) {
         if (!list[i][1] || list[i][1] > capture_pool_max() || list[i][0] >= (1ull << 40)) continue;
+        // (Phase 2: bulk-render pools leave the capture's scans; their contents go through the write-back's tile
+        // path. Gated on the split: RX_VK_DIRTY_ORIGIN=0 keeps every pool scanned, as before)
+        if (wbd_pool_excluded_from_capture(wbd_pool_bulk_render(list[i][0] & ~4095ull), dirty_origin_on())) continue;
         auto it = pool_first_seen.find(list[i][0]);
         const uint64_t first = it != pool_first_seen.end() ? it->second : captures_made;
         seen[list[i][0]] = first;
@@ -1346,6 +1389,76 @@ void wb_pages_note(uint64_t guest_lo, uint64_t guest_hi, uint64_t value) {
     for (uint64_t p = guest_lo >> kPageShift; p <= (guest_hi - 1) >> kPageShift; p++) wb_pages.set(p, value);
 }
 } // namespace
+
+// ---- Phase 2: two-tier pipelined write-back (URGENT vs BULK) ----
+// The end's emission is split in two. URGENT is the latency-sensitive small set: pages memory_rb_refresh refreshes
+// (readback results the CPU is about to read), write-back runs of 16 KB or less, and odd (non-word-aligned) leftovers,
+// which the diff pass cannot take. BULK is everything else (framebuffer tiles), through the diff path as today. Urgent
+// runs are whole-copied first, right after the end's first transfer_barrier, and carry their own timeline value
+// (mem_urgent_value, noted per page in wb_urgent_pages); vk_replay.cpp invalidate waits on that value only, so a
+// readback never waits for a framebuffer's bulk compare. Prediction/caching: the small-result set is stable across
+// submits, so the last urgent value for an unchanged range is kept (WbUrgentCache, keyed on the range plus a sequence
+// bumped by every urgent note) instead of re-scanning the table. The bulk half still lands before the next capture
+// through the unchanged late logic (capture_make's late_value, which reads wb_pages, where every run is still noted).
+// Pure classifiers (cut by tests/test_wb_tier_split.py); everything below only runs while dirty_origin_on(), so
+// RX_VK_DIRTY_ORIGIN=0 disables all of it and invalidate falls back to memory_writeback_value, as before.
+// Ordering: urgent copies sit after the first transfer_barrier (which also orders the older submissions' write-backs
+// and this submission's uploads ahead of them) and the table_flush updates, which are recorded into the upload command
+// buffer ahead of this submission's work; rb_hazards were stamped at bind time, before the end classifies, so the
+// rb_refresh overlap test sees the whole submission's hazards. The final transfer_barrier orders both tiers ahead of
+// the next submission's work.
+enum class WbTier : uint8_t { Urgent = 0, Bulk = 1 };
+inline WbTier wb_tier_of(uint64_t size, bool rb_refresh, bool odd) {
+    if (rb_refresh || size <= (16u << 10) || odd) return WbTier::Urgent;
+    return WbTier::Bulk;
+}
+inline WbTier wb_tier_of_gated(uint64_t size, bool rb_refresh, bool odd, bool split_on) {
+    if (!split_on) return WbTier::Bulk;   // (kill switch: everything the bulk path, as before)
+    return wb_tier_of(size, rb_refresh, odd);
+}
+// (the last urgent value returned for a range, and the note sequence it was true at: a hit avoids re-scanning)
+struct WbUrgentCache {
+    uint64_t lo = 0, hi = 0, value = 0, seq = 0;
+    bool ever = false, valid = false;
+    bool hit(uint64_t qlo, uint64_t qhi, uint64_t cur_seq) const {
+        return valid && qlo == lo && qhi == hi && cur_seq == seq;
+    }
+    void store(uint64_t qlo, uint64_t qhi, uint64_t v, bool e, uint64_t cur_seq) {
+        lo = qlo, hi = qhi, value = v, ever = e, seq = cur_seq, valid = true;
+    }
+    void reset() { valid = false; }
+};
+namespace {
+WbPages wb_urgent_pages;   // (per-page urgent values: the URGENT tier's write-backs, same value space as wb_pages)
+uint64_t mem_urgent_value = 0;   // (the value the urgent half's signal carries: stored here when it is recorded)
+uint64_t wb_urgent_seq = 0;   // (bumped by every urgent note: the urgent cache's invalidation)
+WbUrgentCache wb_urgent_cache;
+void wb_urgent_note(uint64_t guest_lo, uint64_t guest_hi, uint64_t value) {
+    static const bool off = getenv("RX_VK_NO_READBACK_WAIT") != nullptr;
+    if (off || !value || guest_hi <= guest_lo) return;
+    std::lock_guard lk(wb_pages_mu);
+    for (uint64_t p = guest_lo >> kPageShift; p <= (guest_hi - 1) >> kPageShift; p++) wb_urgent_pages.set(p, value);
+    wb_urgent_seq++;
+}
+} // namespace
+/// The newest submission value whose URGENT write-back reaches into [guest, guest + size) (0: none ever); *ever set
+/// when any urgent write-back ever did. While the split is off this is memory_writeback_value, as before.
+uint64_t memory_writeback_urgent_value(uint64_t guest, uint64_t size, bool* ever) {
+    if (!dirty_origin_on()) return memory_writeback_value(guest, size, ever);   // (kill switch: today's wait)
+    if (ever) *ever = false;
+    if (!size) return 0;
+    std::lock_guard lk(wb_pages_mu);
+    if (wb_urgent_cache.hit(guest, guest + size, wb_urgent_seq)) {
+        if (ever) *ever = wb_urgent_cache.ever;
+        return wb_urgent_cache.value;
+    }
+    uint64_t v = 0;
+    bool e = false;
+    if (!wb_urgent_pages.empty()) v = wb_urgent_pages.max_in(guest >> kPageShift, (guest + size - 1) >> kPageShift, &e);
+    wb_urgent_cache.store(guest, guest + size, v, e, wb_urgent_seq);
+    if (ever) *ever = e;
+    return v;
+}
 uint64_t memory_writeback_value(uint64_t guest, uint64_t size, bool* ever) {
     uint64_t v = 0;
     if (ever) *ever = false;
@@ -2562,6 +2675,9 @@ void rb_hazard_locked(uint64_t lo, uint64_t hi) {   // (pools_mu held)
     // (dirty-origin: every range bound for GPU write stamps gpu_gen, which mirror_sync and the write-back's end read.
     // Idempotent with memory_stamp_gpu's stamp of the same bind: same submission, same gpu_now)
     if (dirty_origin_on() && hi > lo) stamp_gpu_range(lo, hi - lo);
+    // (Phase 2: the tile-dirty prefilter's mask, same ordering point. Idempotent the same way: a tile set twice is
+    // set once. Gated inside wbd_tile_mark_range on the split)
+    if (hi > lo) wbd_tile_mark_range(lo, hi);
 }
 }
 void memory_note_readback(uint64_t guest, uint64_t size) {
@@ -2693,8 +2809,11 @@ bool mirror_make(Pool& pool);   // (below)
 /// The mirrored pools, for the submit-time capture (memory_capture_submit) (pools_mu held)
 void publish_cap_ranges() {
     std::vector<std::pair<uint64_t, uint64_t>> v;
-    for (const auto& [lo, pool] : imported)
+    for (const auto& [lo, pool] : imported) {
+        // (Phase 2: bulk-render pools are not capture ranges; the write-back's tile path takes them. Off: as before)
+        if (wbd_pool_excluded_from_capture(wbd_pool_bulk_render(pool.lo), dirty_origin_on())) continue;
         if (pool.mstate == Pool::MIRROR_ON || pool.was_mirrored) v.push_back({pool.lo, pool.hi});
+    }
     std::lock_guard lk(cap_ranges_mu);
     cap_ranges.swap(v);
     cap_ranges_ver++;
@@ -3126,6 +3245,7 @@ void memory_begin_submission() {
     retired_imports_give_back();
     mirror_epoch++;
     gpu_now++;   // (dirty-origin: this submission's GPU stamps; Pool::gpu_synced is set from it at the end)
+    if (dirty_origin_on()) wbd_dirty_tiles.clear();   // (Phase 2: this submission's tile dirt starts empty)
     mirror_upload = true;
     mirror_synced.clear();
     writebacks.clear();
@@ -3576,6 +3696,49 @@ struct WbdChunk {   // (shaders/wb_diff.comp's Chunk)
     uint64_t mirror, shadow, guest;
     uint32_t count, vecs;   // (16-byte vectors when vecs is 1, else words)
 };
+// ---- Phase 2: GPU tile-dirty prefilter ----
+// Pools are carved into fixed 64 KB tiles, matching wbd_split's max vector chunk, with one bit of device-side dirt
+// per tile. The bit is set at bind time in rb_hazard_locked (the same ordering point as the gpu_gen stamp: every
+// range bound for GPU write marks its tiles before the end intersects). The end intersects the merged runs with the
+// mask and only dirty tiles become WbdChunks; clean tiles compare equal to the shadow by construction (nothing wrote
+// the mirror there since the pool's sync) and are skipped. The mask is GPU-resident in the full design (an indirect-
+// dispatch count via a tiny prefix kernel); the subgroup-vote gate below is its fallback: without subgroup votes in
+// compute (wbd_pipe_ready false) the prefilter is off and every chunk dispatches whole, as before.
+// Pure (cut by tests/test_wb_tile_prefilter.py); gated on the split throughout, so RX_VK_DIRTY_ORIGIN=0 disables it.
+// Both-dirty order is unchanged (mirror_sync's capture-then-live order); CapEntry.gpu marks are untouched (mirror_sync
+// still sets them, every reader still skips e.gpu); pages with pending wb_pages values are never culled (the keep
+// predicate below keeps any tile with a pending page, and the page-level wbd_keep_page still runs first).
+struct WbdTileSet {
+    static constexpr uint64_t kTile = 64u << 10, kShift = 16;   // (64 KB tiles: wbd_split's max)
+    std::set<uint64_t> tiles;   // (absolute guest 64 KB tile indices dirtied this submission; sparse: pools are large)
+    void mark_range(uint64_t lo, uint64_t len) {   // (an absolute guest byte range bound for GPU write)
+        if (!len) return;
+        for (uint64_t t = lo >> kShift; t <= ((lo + len - 1) >> kShift); t++) tiles.insert(t);
+    }
+    bool dirty(uint64_t tile) const { return tiles.count(tile) != 0; }
+    void clear() { tiles.clear(); }
+    bool full() const { return tiles.size() > (2u << 20); }   // (runaway: fall back to whole chunks)
+};
+inline uint64_t wbd_tile_of(uint64_t addr) {
+    return addr >> WbdTileSet::kShift;
+}
+inline bool wbd_tile_keep(bool tile_dirty, bool all_known, bool any_pending, bool fallback_whole) {
+    if (fallback_whole) return true;   // (no subgroup votes: whole-chunk dispatch, as before)
+    if (any_pending) return true;   // (never cull pages with pending write-back values: readback ordering)
+    if (!all_known) return true;   // (unknown tiles still need their fill from guest memory, then the compare)
+    return tile_dirty;
+}
+inline bool wbd_tile_prefilter_on(bool split_on, bool pipe_ready) {
+    return split_on && pipe_ready;   // (kill switch, then the subgroup-vote gate's fallback)
+}
+namespace {
+WbdTileSet wbd_dirty_tiles;   // (this submission's GPU-dirty 64 KB tiles, absolute guest; cleared at the next begin)
+void wbd_tile_mark_range(uint64_t lo, uint64_t hi) {
+    if (hi <= lo || !dirty_origin_on()) return;   // (kill switch: no tile state while off)
+    if (wbd_dirty_tiles.full()) return;   // (runaway: whole chunks, as before)
+    wbd_dirty_tiles.mark_range(lo, hi - lo);
+}
+} // namespace
 // (the pass's tables, mapped, a ring: one is taken again once the submission that read it is done)
 struct WbdTable {
     VkBuffer buf = VK_NULL_HANDLE;
@@ -3611,6 +3774,19 @@ WbdTable* wbd_table_get(uint64_t bytes) {
     return &t;
 }
 
+// (Phase 2: whether a write-back run touches a page memory_rb_refresh refreshes this submission (the readback pages
+// the CPU is about to read): such runs are URGENT. pools_mu held, as the end; rb_pages carries mirror_epoch marks)
+bool wb_run_is_rb_refresh(uint64_t glo, uint64_t size) {
+    if (!size || rb_pages.empty()) return false;
+    const uint64_t p0 = glo >> kPageShift, p1 = std::min((glo + size - 1) >> kPageShift, kPages - 1);
+    for (uint64_t pg = p0; pg <= p1; pg++) {
+        const auto it = rb_pages.find((uint32_t)pg);
+        if (it != rb_pages.end() && it->second == mirror_epoch) return true;
+    }
+    return false;
+}
+int64_t st_wb_urgent_runs = 0, st_wb_urgent_bytes = 0, st_wb_bulk_runs = 0, st_wb_bulk_bytes = 0;
+
 void memory_end_submission(VkCommandBuffer cmd) {
     std::lock_guard lk(pools_mu);
     {   // (every 600 submissions: how the mirror syncs' dirty pages were read)
@@ -3629,13 +3805,17 @@ void memory_end_submission(VkCommandBuffer cmd) {
             if (shadow_bytes || st_wbd_runs)
                 logf("vk: write-back diff (600 submits): %lld runs, %.1f MB compared; %lld pages read into the shadows; %llu MB of shadows; "
                      "pages the shadows knew that the CPU wrote: %lld in captures, %lld only in the collection, %lld only by the replay itself; "
-                     "large bindings kept %lld / skipped %lld (RX_VK_WB_MAX_KB), capture ranges pruned %lld",
+                     "large bindings kept %lld / skipped %lld (RX_VK_WB_MAX_KB), capture ranges pruned %lld; "
+                     "urgent %lld runs / %.1f MB, bulk %lld runs / %.1f MB (of %.1f MB written back)",
                      (long long)st_wbd_runs, st_wbd_bytes / 1048576.0, (long long)st_wbd_fill_pages, (unsigned long long)(shadow_bytes >> 20),
                      (long long)st_wbd_known_game, (long long)st_wbd_known_collected, (long long)st_wbd_known_replay,
-                     (long long)st_wb_large_kept, (long long)st_wb_large_skipped, (long long)st_cap_pruned);
+                     (long long)st_wb_large_kept, (long long)st_wb_large_skipped, (long long)st_cap_pruned,
+                     (long long)st_wb_urgent_runs, st_wb_urgent_bytes / 1048576.0,
+                     (long long)st_wb_bulk_runs, st_wb_bulk_bytes / 1048576.0, st_wb_bytes / 1048576.0);
             st_wbd_runs = st_wbd_bytes = st_wbd_fill_pages = 0;
             st_wbd_known_game = st_wbd_known_collected = st_wbd_known_replay = 0;
             st_wb_large_kept = st_wb_large_skipped = st_cap_pruned = 0;
+            st_wb_urgent_runs = st_wb_urgent_bytes = st_wb_bulk_runs = st_wb_bulk_bytes = 0;
             std::vector<std::pair<int64_t, uint64_t>> top;
             for (const auto& [lo, k] : live_by_pool) top.push_back({k, lo});
             std::sort(top.rbegin(), top.rend());
@@ -3731,6 +3911,37 @@ void memory_end_submission(VkCommandBuffer cmd) {
             checkpoint_mark(cmd, p->lo, 'b');
             uint64_t run_bytes = 0;
             for (const VkBufferCopy& r : runs) run_bytes += r.size;
+            // (Phase 2: the capture budget observes every pool's write-back coverage, bulk or not)
+            if (dirty_origin_on()) wbd_pool_observe(p->lo, run_bytes, p->hi - p->lo);
+            // (Phase 2: URGENT first, whole, right after the first transfer_barrier above. Small results the CPU
+            // reads, rb_refresh pages and odd leftovers go whole and carry the urgent value; the bulk rest takes the
+            // diff path below. The urgent signal is the submission's own today (one submit, one signal:
+            // mem_urgent_value == mem_rec_value), so invalidate's urgent wait is today's wait, only narrower; a split
+            // submit signalling urgent right after these copies is staged, not this change. Pending pages are never
+            // culled: urgent runs copy whole by construction)
+            if (dirty_origin_on()) {
+                std::vector<VkBufferCopy> urgent, bulk;
+                for (const VkBufferCopy& r : runs) {
+                    const bool odd_run = ((r.dstOffset | r.size) & 3) != 0;
+                    const bool rb = wb_run_is_rb_refresh(p->lo + r.dstOffset, r.size);
+                    (wb_tier_of_gated(r.size, rb, odd_run, true) == WbTier::Urgent ? urgent : bulk).push_back(r);
+                }
+                if (!urgent.empty()) {
+                    vkCmdCopyBuffer(cmd, p->mirror, p->buffer, (uint32_t)urgent.size(), urgent.data());
+                    for (const VkBufferCopy& r : urgent) {
+                        shadow_forget(*p, r.dstOffset, r.size);   // (guest now holds the mirror: the shadow relearns it)
+                        wb_pages_note(p->lo + r.dstOffset, p->lo + r.dstOffset + r.size, mem_rec_value);
+                        wb_urgent_note(p->lo + r.dstOffset, p->lo + r.dstOffset + r.size, mem_rec_value);
+                    }
+                    for (const VkBufferCopy& r : urgent)
+                        st_wb_bytes += (int64_t)r.size, gp.bytes += r.size, st_wb_urgent_bytes += (int64_t)r.size;
+                    gp.items += (int)urgent.size();
+                    st_wb_urgent_runs += (int64_t)urgent.size();
+                    mem_urgent_value = mem_rec_value;   // (this submission's urgent half is recorded: invalidate reads it)
+                }
+                runs.swap(bulk);
+                if (runs.empty()) continue;
+            }
             if (diff && !p->shadow && run_bytes >= (256u << 10)) shadow_make(*p);   // (a pool whose write-back is worth one, as VRAM allows)
             if (diff && p->shadow && p->address && p->mirror) {
                 // (dirty-origin: the merged runs intersected with (unknown-to-shadow pages ∪ GPU-dirty set) before
@@ -3757,6 +3968,36 @@ void memory_end_submission(VkCommandBuffer cmd) {
                         }
                     }
                     runs.swap(kept);
+                    // (Phase 2: tile-dirty prefilter. The kept runs intersected with the GPU's tile mask, in absolute
+                    // guest 64 KB tiles: only dirty tiles become WbdChunks. A tile with a pending page, or one the
+                    // shadow does not know, is always kept (wbd_tile_keep); without the pipe (subgroup votes) every
+                    // chunk dispatches whole, as before. The page-level wbd_keep_page above still runs first)
+                    if (wbd_tile_prefilter_on(true, diff)) {
+                        std::vector<VkBufferCopy> tiled;
+                        for (const VkBufferCopy& r : runs) {
+                            const uint64_t glo0 = p->lo + r.dstOffset, glo1 = glo0 + r.size;
+                            for (uint64_t t = wbd_tile_of(glo0); t <= wbd_tile_of(glo1 - 1); t++) {
+                                const uint64_t a = std::max(glo0, t << WbdTileSet::kShift) - p->lo,
+                                               b = std::min(glo1, (t + 1) << WbdTileSet::kShift) - p->lo;
+                                bool all_known = true, any_pending = false;
+                                for (uint64_t pg = a >> kPageShift; (pg << kPageShift) < b; pg++) {
+                                    if (pg >= (uint64_t)p->shadow_known.size() * 64 ||
+                                        !((p->shadow_known[pg >> 6] >> (pg & 63)) & 1ull))
+                                        all_known = false;
+                                    const uint64_t gpg = (p->lo >> kPageShift) + pg;
+                                    if (gpg < kPages && std::binary_search(wb_pending_pages.begin(), wb_pending_pages.end(),
+                                                                          (uint32_t)gpg))
+                                        any_pending = true;
+                                }
+                                if (!wbd_tile_keep(wbd_dirty_tiles.dirty(t), all_known, any_pending, false)) continue;
+                                if (!tiled.empty() && tiled.back().srcOffset + tiled.back().size == a)
+                                    tiled.back().size = b - tiled.back().srcOffset;
+                                else
+                                    tiled.push_back({a, a, b - a});
+                            }
+                        }
+                        runs.swap(tiled);
+                    }
                 }
                 if (runs.empty()) continue;
                 VkBufferDeviceAddressInfo mda{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
@@ -3802,8 +4043,10 @@ void memory_end_submission(VkCommandBuffer cmd) {
             } else {
                 vkCmdCopyBuffer(cmd, p->mirror, p->buffer, (uint32_t)runs.size(), runs.data());
             }
-            for (const VkBufferCopy& r : runs) st_wb_bytes += (int64_t)r.size, gp.bytes += r.size;
+            for (const VkBufferCopy& r : runs)
+                st_wb_bytes += (int64_t)r.size, gp.bytes += r.size, st_wb_bulk_bytes += (int64_t)r.size;
             gp.items += (int)runs.size();
+            st_wb_bulk_runs += (int64_t)runs.size();
             for (const VkBufferCopy& r : runs) wb_pages_note(p->lo + r.dstOffset, p->lo + r.dstOffset + r.size, mem_rec_value);   // (EvilBoyce)
             {   // (hookshot) RX_VK_LOG_WRITEBACK=1: the pools written back the most, every 600 write-back submissions
                 static const bool log_wb = getenv("RX_VK_LOG_WRITEBACK") != nullptr;

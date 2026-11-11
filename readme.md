@@ -708,6 +708,12 @@ mirror syncs copy every dirty page, captures scan every range and write-backs co
 the pre-split behavior (and #1629's size gate unmodified). Set it for an A/B when a flash or a slowdown looks like the
 split's doing.
 
+Phase 2 pipelines that write-back in two tiers: urgent (readback pages, runs of 16 KB or less, odd leftovers) first
+and whole, bulk (framebuffer tiles) through the diff as before; `invalidate` waits on the urgent value only. Pools
+whose write-backs cover over half their size for 3+ submissions leave the capture's scans for the tile path, and the
+diff compares only GPU-dirtied 64 KB tiles. All of it is under the same switch: `RX_VK_DIRTY_ORIGIN=0` disables every
+tier, tile and budget of it.
+
 </details>
 
 ## How it works

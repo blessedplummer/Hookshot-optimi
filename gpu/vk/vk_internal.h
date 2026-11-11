@@ -218,6 +218,9 @@ void memory_drop_shadow(uint64_t guest, uint64_t size);   // (a write the captur
 /// (EvilBoyce) the newest submission value whose write-back reaches into [guest, guest + size) (0: none ever); *ever set
 /// when any write-back ever did
 uint64_t memory_writeback_value(uint64_t guest, uint64_t size, bool* ever);
+/// (Phase 2) the newest submission value whose URGENT write-back reaches into [guest, guest + size) (0: none ever);
+/// *ever set when any urgent write-back ever did. While the split is off this is memory_writeback_value, as before
+uint64_t memory_writeback_urgent_value(uint64_t guest, uint64_t size, bool* ever);
 void memory_note_readback(uint64_t guest, uint64_t size);   // (PR 430) a CPU read of GPU results: see memory_rb_refresh
 bool memory_rb_refresh(VkCommandBuffer up);
 void memory_rb_recording_begun();   // (hookshot) at a recording's start, on its thread: the submission it joins (memory_rb_refresh)

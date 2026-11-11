@@ -2270,7 +2270,9 @@ void invalidate(uint64_t gpu, uint64_t size) {
     if (size) {
         static const bool off = getenv("RX_VK_NO_READBACK_WAIT") != nullptr;
         bool ever = false;
-        if (!off && (memory_writeback_value(host->gpu_guest(gpu), size, &ever), ever)) {
+        // (Phase 2: the wait is on the URGENT value only: readback pages are small results, rb_refresh pages and odd
+        // leftovers, which the end whole-copies first. Off: memory_writeback_urgent_value is the full value, as before)
+        if (!off && (memory_writeback_urgent_value(host->gpu_guest(gpu), size, &ever), ever)) {
             memory_note_readback(host->gpu_guest(gpu), size);   // (PR 430: the CPU may write it back: memory_rb_refresh)
             static std::atomic<int64_t> calls{0}, waited{0}, ns{0};
             const auto w0 = std::chrono::steady_clock::now();
@@ -2286,7 +2288,7 @@ void invalidate(uint64_t gpu, uint64_t size) {
             const bool unforced = !async_on() && sync_waits_on() && !per_queue_fences_off();
             if (behind0 && !no_catchup && !unforced) wait_queue_empty(), w = true;   // (work handed over may write it back too)
             const auto w1 = std::chrono::steady_clock::now();
-            const uint64_t v = memory_writeback_value(host->gpu_guest(gpu), size, nullptr);
+            const uint64_t v = memory_writeback_urgent_value(host->gpu_guest(gpu), size, nullptr);
             if (v > completed()) {
                 int ok = 0;
                 if (!(unforced && wait_recorded(v, UINT64_MAX, &ok))) {
