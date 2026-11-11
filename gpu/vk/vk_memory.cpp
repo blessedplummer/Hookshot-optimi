@@ -2390,6 +2390,8 @@ void retire_pool(std::map<uint64_t, Pool>::iterator it) {
         logf("vk: pool %#llx remade larger (%zu retired)", (unsigned long long)old->lo, retired_pools.size());
 }
 int64_t st_sync_bytes, st_sync_copies, st_wb_bytes, st_mirrors;
+int64_t st_wb_large_kept = 0, st_wb_large_skipped = 0;   // (dirty-origin: #1629's oversize gate kept / skipped; defined
+// here, ahead of its first use in gpu_buffer_bind: Phase 1 put it by the diff's readers, past the use)
 int64_t st_sync_live_pages, st_sync_cap_pages, st_sync_old_pages;   // (mirror syncs' dirty pages: live / this submit's capture / an earlier one's)
 int64_t st_sync_gpu_only = 0;   // (dirty-origin: GPU-dirty-only pages skipped, the mirror holds the truth)
 std::unordered_map<uint64_t, int64_t> live_by_pool;
@@ -3341,7 +3343,6 @@ struct DeadShadow {
 std::deque<DeadShadow> dead_shadows;
 uint64_t shadow_bytes = 0;
 int64_t st_wbd_runs = 0, st_wbd_bytes = 0, st_wbd_fill_pages = 0;
-int64_t st_wb_large_kept = 0, st_wb_large_skipped = 0;   // (dirty-origin: #1629's oversize gate kept / skipped)
 bool wb_diff_on() {
     // (hookshot) On by default again (v2.0.11). v2.0.9 turned it off with the presents' own queue after the device lost on an RTX 4090
     // with NVIDIA's 621 driver (issue 1161); the reporter's A/B then put that on the present queue (black screen with it alone), and the
