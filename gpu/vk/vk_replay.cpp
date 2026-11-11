@@ -287,11 +287,14 @@ void vk_timeline_wait(uint64_t v) {   // (at most 250 ms: a submission held back
     }
 }
 // (hookshot, RX_VK_DGPU) the GPU time the recordings collected so far, in ns, never reset: the dGPU policy's trials
-// (vk_memory.cpp dgpu_trials) measure a pool in guest memory against its mirror from it. st_gpu_ns itself is reset by
-// the 120-frame status line; the trials' deltas must not see that. At this file's outer namespace: vk_internal.h
-// declares it, vk_memory.cpp calls it, and an anonymous namespace here would leave it unresolved at the link
-int64_t gpu_ns_total = 0;
-int64_t gpu_time_total_ns() { return gpu_ns_total; }
+// (vk_memory.cpp dgpu_trials) measure a pool in guest memory against its mirror from it: the present-to-present
+// total, never reset - the 120-frame status line resets st_gpu_ns, the trials' deltas must not see that. At this
+// file's outer namespace: vk_internal.h declares it, vk_memory.cpp calls it, and an anonymous namespace here would
+// leave it unresolved at the link. Present to present, not the recordings' GPU timestamps: the mirror's cost is
+// mostly CPU (the sync around a submission) and in the upload command buffer the timestamps never see, and a
+// GPU-only verdict kept mirrors while the frame was CPU-bound - which is the case this policy exists for
+int64_t present_ns_total = 0;
+int64_t present_time_total_ns() { return present_ns_total; }
 namespace {
 
 int64_t st_wait_ns;   // (time the replay waited for a recording slot: the GPU behind)
@@ -310,7 +313,6 @@ void gpu_time_collect(Recording& r) {
     if (t[1] <= t[0]) return;
     const int64_t ns = (int64_t)((t[1] - t[0]) * (double)dev.props.limits.timestampPeriod);
     st_gpu_ns += ns;
-    gpu_ns_total += ns;
     st_gpu_max_ns = std::max(st_gpu_max_ns, ns);
 }
 }   // namespace
@@ -1354,10 +1356,16 @@ void maybe_split(VkCommandBuffer& cmd) {
 // (hookshot) One cause of those is gone: the dry pass did not mark the targets of a clear (NOP_CLEAR_COLOR in replay()). With
 // that, Castle Town's market and eight other places showed no black frame on 3 to 8 threads; the Kakariko walk was not run
 // again, so it stays off. On a 9950X3D the replay's wall time in the market goes from 10.9 ms a frame to 7.75 on 3 threads.
+// (at the outer namespace, not the anonymous one: vk_internal.h declares it, vk_memory.cpp's dgpu_pick calls it - the
+// dGPU policy runs trial-less under RX_VK_PARALLEL)
+}   // namespace
+
 int par_threads() {
     static const int n = std::clamp(getenv("RX_VK_PARALLEL") ? atoi(getenv("RX_VK_PARALLEL")) : 0, 0, 8);
     return n;
 }
+
+namespace {
 struct ParPool {
     std::mutex mu;
     std::condition_variable cv, done;
@@ -3574,7 +3582,17 @@ void do_present(const nvn_tex* t, const int crop[4]) {
         }
         log_frame_stats();
     }
-    if (dev.offscreen) frame_log_present();   // (no window: the copy into the offscreen image above is its present)
+    if (dev.offscreen) {
+        // (and the present-to-present total, the same tick present_finish makes for a windowed run: the copy above
+        // is the present, and a headless run's trials deserve the same frame-relevant verdict numbers. A run is
+        // one or the other, never both, so the statics inside present_finish are not shared with this)
+        static std::chrono::steady_clock::time_point prev;
+        static bool have = false;
+        const auto t = std::chrono::steady_clock::now();
+        if (have) present_ns_total += std::chrono::duration_cast<std::chrono::nanoseconds>(t - prev).count();
+        prev = t, have = true;
+        frame_log_present();   // (no window: the copy into the offscreen image above is its present)
+    }
     if (dev.offscreen || interpolated) return;
     present_image(src, sw, sh, crop, direct_view);
 }
@@ -4091,6 +4109,21 @@ namespace {
 /// What follows a present, on the thread that made it. The presenter thread asks the next present_image for a new swapchain (its
 /// swap_resize) rather than making one itself
 void present_finish(VkResult res, bool on_presenter) {
+    // (vk_memory.cpp dgpu_trials) the frame's present-to-present total, one clock read a present, never reset. It
+    // lives here, not in present_out, because this is the one function every made present passes through exactly
+    // once: the game thread's presents (present_out) and the presenter thread's (present_thread_on, which hands the
+    // present off and never reaches present_out's end) - and a run uses one or the other, never both, so the two
+    // statics below are only ever touched by the thread that presents. The trials' verdict compares the frame the
+    // player gets, which carries the mirror's every cost (the CPU sync around a submission, the copies in the
+    // upload buffer) and its benefit (VRAM reads where PCIe would show) - the recordings' GPU timestamps see
+    // neither side whole
+    {
+        static std::chrono::steady_clock::time_point prev;
+        static bool have = false;
+        const auto t = std::chrono::steady_clock::now();
+        if (have) present_ns_total += std::chrono::duration_cast<std::chrono::nanoseconds>(t - prev).count();
+        prev = t, have = true;
+    }
     if (res < 0 && res != VK_ERROR_OUT_OF_DATE_KHR) {   // (a present that failed: said, a few times)
         static int logged;
         if (logged++ < 8) logf("vk: present failed (VkResult %d%s)", (int)res, dev.present_queue_supported ? ", on the presents' own queue" : "");

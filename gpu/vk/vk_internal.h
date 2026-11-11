@@ -127,6 +127,9 @@ struct BufferRef {
     VkBuffer buffer = VK_NULL_HANDLE;
     uint64_t offset = 0, size = 0;
     VkDeviceAddress address = 0;
+    bool live = false;   // (hookshot, RX_VK_DGPU) the binding is the pool's guest memory itself and the recording will
+                         // be executed: the GPU reads it when it runs, and the game may rewrite it before then. A
+                         // mirror's binding is not (its copy was synced at the submit); outside a recording, neither
     explicit operator bool() const {
         return buffer != VK_NULL_HANDLE;
     }
@@ -146,6 +149,9 @@ BufferRef gpu_buffer(uint64_t gpu, uint64_t size);   // (empty when no pool hold
 /// A range as a binding of the replay sees it: the pool's VRAM mirror when it has one (vk_memory.cpp), else the
 /// imported pool. written: the GPU may write it (copied back to guest memory at the submission's end).
 BufferRef gpu_buffer_bind(uint64_t gpu, uint64_t size, bool written);
+/// (vk_memory.cpp) the binding is in-place guest memory a recording will execute (the #1795 class) under the dGPU
+/// policy: the uniform buffer that binds it is copied as submitted instead of bound there
+bool dgpu_ub_in_place(const BufferRef& b);
 BufferRef stream_copy(const void* src, uint64_t n);   // vk_draw.cpp: bytes in the recording's stream, as a binding
 /// Authored constants in the recording's stream: never recycled until its recording completes.
 /// Fill mapped, then flush memory through binding.offset + binding.size before GPU use.
@@ -183,6 +189,8 @@ void checkpoint_mark(VkCommandBuffer cmd, uint64_t key, char kind);
 /// what they share (textures and their uploads, programs, pipelines, samplers, pools and memory stamps) is used under
 /// one lock; the per-draw caches are each thread's own
 extern std::atomic<bool> par_active;
+/// (vk_replay.cpp) RX_VK_PARALLEL as it reads it: 2 or more record a submission's segments on several threads
+int par_threads();
 extern std::atomic<int64_t> par_lock_wait_ns, par_locks;   // (contention: the time threads waited for it)
 std::recursive_mutex& par_mutex();
 int64_t par_now_ns();
@@ -245,10 +253,12 @@ bool ub_read(uint64_t addr, void* dst, uint64_t n);
 /// [guest, guest + n) as of the submit being replayed: live itself, or scratch holding it with the kept pages over it
 const uint8_t* memory_as_submitted(uint64_t guest, const uint8_t* live, uint64_t n, std::vector<uint8_t>& scratch);
 void memory_drop_shadow(uint64_t guest, uint64_t size);   // (a write the capture did not take: the copies go)
-/// (vk_replay.cpp) the GPU time the recordings collected so far, in ns, never reset: the dGPU policy's trials
-/// (vk_memory.cpp dgpu_trials) measure a pool in guest memory against its mirror from it. st_gpu_ns itself is reset
-/// by the 120-frame status line; the trials' deltas must not see that
-int64_t gpu_time_total_ns();
+/// (vk_replay.cpp) the frame's present-to-present time so far, in ns, never reset: the dGPU policy's trials
+/// (vk_memory.cpp dgpu_trials) measure a pool in guest memory against its mirror from it. The verdict compares the
+/// frame the player gets - the mirror's cost is mostly CPU and in the upload buffer, which the recordings' GPU
+/// timestamps never see, and the frame is CPU-bound where this policy wins. st_gpu_ns itself is reset by the
+/// 120-frame status line; the trials' deltas must not see that
+int64_t present_time_total_ns();
 /// (EvilBoyce) the newest submission value whose write-back reaches into [guest, guest + size) (0: none ever); *ever set
 /// when any write-back ever did
 uint64_t memory_writeback_value(uint64_t guest, uint64_t size, bool* ever);

@@ -18,15 +18,19 @@
 namespace dgpu {
 
 // A promotion trial for one pool, phases on the game's own frames:
-// Base - the pool in guest memory, its window's GPU time kept as the before;
+// Base - the pool in guest memory, its window's frame time kept as the before;
 // Mirror - the caller gives the pool its mirror (made at the pool's next binding, as stock makes one) and the
 //          phase settles: the make copies the whole pool into it, and the first frames on new buffer addresses are
 //          the make's own cost, not the pool's;
-// Measure - the same GPU time with the mirror, the after.
+// Measure - the same frame time with the mirror, the after.
 // One trial at a time (a second's numbers would read against a frame the first was still moving; Triforce's
-// demotion ran one the same way). The caller feeds every submission's frame number and the GPU time total
-// (gpu_time_total_ns, vk_replay.cpp: the recordings' own TOP/BOTTOM timestamps, always on, and never reset - the
-// 120-frame status line resets st_gpu_ns, the trials' deltas must not see that).
+// demotion ran one the same way). The caller feeds every submission's frame number and the present-to-present
+// time total (present_time_total_ns, vk_replay.cpp: one clock read a present, always on, and never reset - the
+// 120-frame status line resets st_gpu_ns, the trials' deltas must not see that). Present to present, not the
+// recordings' GPU timestamps: the mirror's cost is mostly CPU (the sync around a submission) and in the upload
+// command buffer, which the timestamps never time, and a GPU-only verdict kept mirrors while the frame was
+// CPU-bound - the case this policy exists for. The mirror's benefit shows the same way (VRAM reads where PCIe
+// would show on a small-BAR device), so the verdict charges and credits the whole frame.
 enum class Act : uint8_t {
     None,     // the phase runs on
     Mirror,   // the before is measured: give the pool its mirror now
@@ -59,7 +63,7 @@ struct Trial {
     }
     void stop() { phase = Idle, lo = 0; }
 
-    // The GPU's ms a frame over the phase so far (a frame count of zero: nothing measured yet).
+    // The frame's ms (present to present) over the phase so far (a frame count of zero: nothing measured yet).
     double ms(uint64_t frame, int64_t gpu_ns) const {
         return frame > f0 ? (double)(gpu_ns - g0) / (double)(frame - f0) / 1e6 : 0.0;
     }

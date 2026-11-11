@@ -2786,10 +2786,13 @@ VkDescriptorBufferInfo uniform_range(const NvnState& s, const Stage& st, uint32_
                 FINE_N(FC_UBO_OVERLAY, 1);
                 return {cur->stream, at, n};
             }
-        // (RX_VK_UB_SNAPSHOT=1: the contents as they are now, in the stream, not the pool the GPU reads later)
+        // (RX_VK_UB_SNAPSHOT=1: the contents as they are now, in the stream, not the pool the GPU reads later. So does
+        // the dGPU policy's refused pool, which has no mirror to sync at the submit: a binding in its guest memory is
+        // read when the recording executes, after the game rewrote its constants - issue 1795's giant HUD heart and
+        // stretched geometry. A trial-won pool binds its mirror, synced at the submit, and keeps the in-place bind)
         static const bool snapshot = env_on("RX_VK_UB_SNAPSHOT");
         BufferRef b = snapshot ? BufferRef{} : gpu_buffer_bind(u.addr, n, false);
-        if (b && b.offset % align == 0) return {b.buffer, b.offset, n};
+        if (b && b.offset % align == 0 && !dgpu_ub_in_place(b)) return {b.buffer, b.offset, n};
         const uint64_t at = stream_alloc(n, align);   // (unaligned or outside the pools: copied into the stream)
         if (at == UINT64_MAX) return bi;
         FINE_N(FC_UBO_STREAM, 1);

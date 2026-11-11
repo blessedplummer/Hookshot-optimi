@@ -14,11 +14,11 @@ int main() {
     Trial t;
     CHECK(t.phase == P::Idle);
     CHECK(t.step(1000, 0) == Act::None);   // (nothing in trial: no act, whatever the frames)
-    t.start(0x1234ull, 1000, 0);           // (frame 1000, GPU time 0 ns)
+    t.start(0x1234ull, 1000, 0);           // (frame 1000, present total 0 ns)
     CHECK(t.phase == P::Base && t.lo == 0x1234ull);
     // (the base window runs kWindow frames; nothing before that)
     CHECK(t.step(1000 + Trial::kWindow - 1, 1) == Act::None);
-    // (over the window, 2.0 ms a frame of GPU time: 240e6 ns over 120 frames)
+    // (over the window, 2.0 ms a frame: 240e6 ns over 120 frames)
     CHECK(t.step(1000 + Trial::kWindow, 240'000'000ll) == Act::Mirror);
     CHECK(t.phase == P::Settle && t.direct_ms == 2.0);
     // (the settle waits for the mirror to really be on: with the mirror not bound, it holds)
@@ -33,7 +33,7 @@ int main() {
     CHECK(t.step(1000 + Trial::kWindow + Trial::kSettle - 1, 0, true) == Act::None);   // (still settling)
     CHECK(t.step(1000 + Trial::kWindow + Trial::kSettle, 0, true) == Act::None);
     CHECK(t.phase == P::Measure);
-    // (with the mirror, 1.0 ms a frame: 180e6 ns over the window)
+    // (with the mirror, 1.0 ms a frame of present-to-present: 180e6 ns over the window)
     CHECK(t.step(1000 + Trial::kWindow + Trial::kSettle + Trial::kWindow, 180'000'000ll, true) == Act::Decide);
     CHECK(t.phase == P::Idle);   // (the verdict is the caller's, the trial already idle)
     CHECK(t.mirror_ms == 1.5);   // (180e6 over 120 frames)
