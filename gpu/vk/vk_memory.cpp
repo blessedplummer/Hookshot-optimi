@@ -2689,7 +2689,7 @@ thread_local BindMemo bind_memo[256];
 bool dgpu_on() {
     // (logged only when it is on: house style logs a switch where it changes something, and an unset run's log is
     // stock's log)
-    static const bool v = getenv("RX_VK_DGPU") && atoi(getenv("RX_VK_DGPU")) != 0;
+    static const bool v = env_on("RX_VK_DGPU");
     static const bool logged = [] {
         if (v) logf("vk: dGPU policy on (RX_VK_DGPU): pools bound in guest memory, mirrors only where a trial proves them");
         return true;
@@ -2751,11 +2751,12 @@ void dgpu_skip_add(uint64_t lo) {
 int64_t st_dgpu_trials = 0, st_dgpu_promoted = 0, st_dgpu_released = 0;
 dgpu::Trial dgpu_trial;
 double dgpu_gain_pct() {
-    static const double v = getenv("RX_VK_DGPU_GAIN") ? atof(getenv("RX_VK_DGPU_GAIN")) : 10.0;
+    // (a number, not an on/off switch: env_int's rule in double form; unset, empty or not a number: the default)
+    static const double v = getenv("RX_VK_DGPU_GAIN") && *getenv("RX_VK_DGPU_GAIN") ? atof(getenv("RX_VK_DGPU_GAIN")) : 10.0;
     return v;
 }
 double dgpu_floor_ms() {
-    static const double v = getenv("RX_VK_DGPU_FLOOR") ? atof(getenv("RX_VK_DGPU_FLOOR")) : 0.25;
+    static const double v = getenv("RX_VK_DGPU_FLOOR") && *getenv("RX_VK_DGPU_FLOOR") ? atof(getenv("RX_VK_DGPU_FLOOR")) : 0.25;
     return v;
 }
 Pool* dgpu_pool_at(uint64_t lo) {
@@ -3772,6 +3773,8 @@ void dgpu_trials() {
     }
 }
 void dgpu_pick() {   // (the 600-submits window's reads, per pool: the heaviest pool not decided yet)
+    // (default on: unset, the trials are the policy's point; =0 turns them off for a pure-direct A/B. env_on has no
+    // default-on form)
     static const bool trials = getenv("RX_VK_DGPU_TRIALS") ? atoi(getenv("RX_VK_DGPU_TRIALS")) != 0 : true;
     // (not in a parallel replay's segments: the trial's mirror is made at a binding, and a parallel segment's
     // binds defer the make, so the measured window would compare direct against direct and the verdict would

@@ -39,9 +39,10 @@ def check_source():
     replay = (ROOT / "gpu/vk/vk_replay.cpp").read_text(encoding="utf-8")
     internal = (ROOT / "gpu/vk/vk_internal.h").read_text(encoding="utf-8")
     docs = (ROOT / "docs/development.md").read_text(encoding="utf-8")
-    # (the policy is opt-in, one switch, and says so once - only when it is on: unset, the log is stock's)
+    # (the policy is opt-in, one switch (env_on's rule since #2042), and says so once - only when it is on: unset,
+    # the log is stock's)
     need("vk_memory.cpp: dgpu_on()", block(mem, "bool dgpu_on()"),
-         ['getenv("RX_VK_DGPU")', "if (v) logf(\"vk: dGPU policy on (RX_VK_DGPU)"])
+         ['env_on("RX_VK_DGPU")', "if (v) logf(\"vk: dGPU policy on (RX_VK_DGPU)"])
     # (a pool's first binding makes no mirror and queues none under the policy: it is marked refused, so its later
     # read binds take the lock-free fast path, and its writes land in guest memory itself)
     bind = block(mem, "BufferRef gpu_buffer_bind(")
