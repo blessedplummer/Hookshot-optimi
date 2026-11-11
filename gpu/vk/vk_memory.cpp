@@ -2593,7 +2593,15 @@ void memory_note_readback(uint64_t guest, uint64_t size) {
     std::lock_guard lk(pools_mu);
     if (dgpu_active()) {   // (RX_VK_DGPU: the pool has a page the CPU reads, so its write-back is sparse, not skipped)
         auto pit = imported.upper_bound(guest);
-        if (pit != imported.begin() && guest >= (--pit)->second.lo && guest < pit->second.hi) pit->second.dgpu_read = true;
+        if (pit != imported.begin() && guest >= (--pit)->second.lo && guest < pit->second.hi) {
+            Pool& rp = pit->second;
+            rp.dgpu_read = true;
+            // (the page the CPU reads is copied back at this submission's end, exactly these pages: a readback range
+            // need not be part of a written binding, and the written-bindings filter only sees those. Stock's wait for
+            // the range needs a write-back value, which only a copy ever gives it.)
+            if (rp.mstate == Pool::MIRROR_ON && rp.mirror && mirror_upload && size <= rp.hi - guest)
+                writebacks.push_back({&rp, guest - rp.lo, guest - rp.lo + size});
+        }
     }
     for (uint64_t pg = guest >> kPageShift; pg <= (guest + size - 1) >> kPageShift; pg++) rb_pages[(uint32_t)pg] = mirror_epoch;
 }
