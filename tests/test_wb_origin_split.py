@@ -36,13 +36,16 @@ def main():
     parser.add_argument('--source', type=Path, default=ROOT / 'gpu/vk/vk_memory.cpp')
     args = parser.parse_args()
     text = args.source.read_text(encoding='utf-8')
-    # (the page tables and both stamps, through the generation block's close)
-    start = text.index('constexpr uint64_t kPageShift')
+    # (the page tables and both stamps, opener through the generation block's close: the span must stay balanced,
+    # or the fixture's trailing namespace close misparses everything after it)
+    start = text.index('// ---- page write generations ----')
     end = text.index('} // namespace', text.index('inline uint8_t dirty_origin_of(')) + len('} // namespace')
     tables = text[start:end]
+    if tables.count('namespace {') != tables.count('} // namespace') or not tables.rstrip().endswith('} // namespace'):
+        raise SystemExit('page-table span is not a balanced namespace block; cut markers moved')
     since = block(text, 'bool memory_written_since(')
     keep = block(text, 'inline bool wbd_keep_page(')
-    pages = block(text, 'struct WbPages {')
+    pages = block(text, 'struct WbPages {') + ';'   # (block() stops at the closing brace: terminate the struct)
     fixture = r'''
 #include <algorithm>
 #include <atomic>
@@ -52,6 +55,7 @@ def main():
 #include <memory>
 #include <vector>
 #define CHECK(ok) do { if (!(ok)) { std::fprintf(stderr, "failed line %d: %s\n", __LINE__, #ok); std::exit(1); } } while (0)
+static void logf(const char*, ...) {}   // (dirty_origin_on logs once; the tables themselves never log)
 ''' + tables + '\n' + since + '\n' + keep + '\n' + pages + r'''
 // (the submission pipeline, modelled the way the source drives it: stamp tables at record, classify origins at
 // sync, cull whole queued runs at the end, advance both baselines; the scan prune keeps a lagging base and scans
@@ -65,6 +69,8 @@ static bool scan_keep(uint64_t lo, uint64_t len, bool in_cap, bool even) {
     return memory_written_since(lo, len, prune_seen);
 }
 int main() {
+    CHECK(dirty_origin_on());   // (the split reads on by default; every expectation below classifies with it)
+    CHECK(pages_collected == 0);   // (driven by direct stamps, no collection path ran)
     uint32_t cpu_synced = 1, gpu_synced = 1;   // (a pool synced at generation 1, both sides)
     // submission 1: the CPU writes pages 0,1; the GPU writes pages 1,2
     const uint32_t g1 = ++gen_now, h1 = ++gpu_now;

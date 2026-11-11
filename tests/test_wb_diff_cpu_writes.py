@@ -86,8 +86,8 @@ class ShadowReports(unittest.TestCase):
 
     def test_gpu_writes_stamp_gpu_gen_not_page_gen(self):
         stamp = body(self.memory, "void memory_stamp_gpu(uint64_t guest, uint64_t size) {")
-        self.assertIn("stamp_gpu_range(guest, size)", stamp)   # (GPU writes stamp gpu_gen at bind/record time)
-        self.assertNotIn("memory_stamp(guest, size)", stamp)   # (...no longer page_gen: the CPU's table stays the CPU's)
+        self.assertIn("if (dirty_origin_on()) stamp_gpu_range(guest, size);", stamp)   # (on: gpu_gen only, never page_gen)
+        self.assertIn("else memory_stamp(guest, size);", stamp)   # (off: page_gen for all writes, as before)
         hazard = body(self.memory, "void rb_hazard_locked(uint64_t lo, uint64_t hi) {")
         self.assertIn("stamp_gpu_range(lo, hi - lo)", hazard)   # (every range bound for GPU write, same submission)
 
