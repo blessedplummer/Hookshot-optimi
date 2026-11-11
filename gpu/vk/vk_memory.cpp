@@ -3798,7 +3798,6 @@ void memory_end_submission(VkCommandBuffer cmd) {
                 logf("vk:   bound in guest memory, by pool (the GPU reads these over PCIe; binds and the bytes of their ranges over these 600 submits, "
                      "%.1f MB in all, a range counted once a submit): %s", all / 1048576.0, ds.c_str());
             }
-            direct_by_pool.clear(), direct_bytes_by_pool.clear();
             if (dgpu_on()) {
                 dgpu_pick(direct_bytes_by_pool);   // (this window's reads are the candidates' evidence: picked before they are dropped)
                 for (auto& [lo, p] : imported) p.dgpu_wrote = 0;   // (the next window's writes, with its reads)
@@ -3806,6 +3805,7 @@ void memory_end_submission(VkCommandBuffer cmd) {
                      "%llu MB of mirrors now", (long long)st_dgpu_trials, (long long)st_dgpu_promoted,
                      (long long)st_dgpu_released, (unsigned long long)(mirror_bytes >> 20));
             }
+            direct_by_pool.clear(), direct_bytes_by_pool.clear();
         }
     }
     static const bool no_writeback = env_on("RX_VK_NO_WRITEBACK");   // (an experiment: none)
