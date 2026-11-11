@@ -19,6 +19,13 @@ using VmaAllocation = void*;
 constexpr VkBuffer VK_NULL_HANDLE = 0;
 #include "direct_write_types.inc"
 
+// (the dGPU policy's gate and pieces, as vk_memory.cpp has them: the gate reads the real switch, so this fixture
+// models stock behaviour with RX_VK_DGPU unset; the classification it guards is a no-op the gate never reaches)
+static bool dgpu_on() { const char* e = getenv("RX_VK_DGPU"); return e && atoi(e) != 0; }
+static int dgpu_classify(uint8_t, bool, bool, char, bool) { return 0; }
+static char dgpu_keep_verdict(uint64_t) { return 0; }
+static int64_t st_dgpu_direct = 0, st_dgpu_promoted = 0;
+
 static Pool pool;
 static Pool* last_pool = nullptr;
 static std::mutex pools_mu;

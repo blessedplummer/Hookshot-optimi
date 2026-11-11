@@ -82,6 +82,10 @@ void mirror_sync(Pool& p) {   // (model: no CPU page is dirty here)
     p.synced_epoch = mirror_epoch;
     p.sync_seg = texture_segment();
 }
+// (the dGPU policy's gate and counters, as vk_memory.cpp has them: the gate reads the real switch, so this fixture
+// models stock behaviour with RX_VK_DGPU unset - the sparse paths below compile and stand down)
+bool dgpu_on() { const char* e = getenv("RX_VK_DGPU"); return e && atoi(e) != 0; }
+int64_t st_dgpu_read_pools = 0, st_dgpu_wb_skipped = 0, st_dgpu_wb_copied = 0;
 #include "rb_refresh.inc"
 
 /// gpu_buffer_bind: the pool's mirror when it has one (model of its front), then its actual last lines

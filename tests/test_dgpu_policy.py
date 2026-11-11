@@ -1,10 +1,15 @@
-"""The dGPU PC-like policy's gate, classification and sparse write-back clip (gpu/vk/vk_memory.cpp).
+"""The dGPU PC-like policy's gate, classification and pool-level write-back gate (gpu/vk/vk_memory.cpp).
 
 RX_VK_DGPU turns on three things that answer each other: static pools direct-mapped in guest memory
-(no mirror, no sync, no write-back), GPU-written pools writing back only the pages the CPU is seen
-reading (no diff pass), and one pool at a time trialed in the other state. Unset, every helper
-returns false and the stock paths stand - this test is that claim, checked at each site the policy
-touches, plus the two pure pieces compiled and driven: the classification's decision and the clip.
+(no mirror, no sync, no write-back), GPU-written pools writing back only where the CPU looks (no diff
+pass), and one pool at a time trialed in the other state. Unset, every helper returns false and the
+stock paths stand - this test is that claim, checked at each site the policy touches, plus the two
+pure pieces compiled and driven: the classification's decision and the write-back gate.
+
+The gate is POOL-level on purpose: the game reads GPU results outside the readback API too (the
+replay's record-time reads of indirect and index data), and a page-sparse copy broke exactly that -
+with all copies skipped the same 4K scene issued 3941 draws against 1364 (deepseek's measurement;
+draw-count parity OFF vs ON is the detector). Where the CPU looks, the whole pool's writes go back.
 
 python -I -B tests/test_dgpu_policy.py [--cxx g++]
 """
@@ -43,33 +48,38 @@ def check_source():
                 "void memory_end_submission(VkCommandBuffer cmd) {",
                 "void memory_stamp_gpu(uint64_t guest, uint64_t size) {",
                 "void memory_note_readback(uint64_t guest, uint64_t size) {",
+                "bool memory_pool_gpu_written(uint64_t guest, uint64_t size) {",
                 "void dgpu_trial_run() {",
                 "char dgpu_keep_verdict(uint64_t lo) {",
                 "void dgpu_mark_wrote(uint64_t guest, uint64_t size) {"):
         if "dgpu_on()" not in block(mem, sig):
             raise SystemExit("the dGPU gate is missing in " + sig)
-    # (the write-back queue gate: an unread pool queues nothing, and the clip runs where the diff used to)
-    bind = block(mem, "BufferRef gpu_buffer_bind(uint64_t gpu, uint64_t size, bool written) {")
-    if "p->dgpu_read_n" not in bind or "st_dgpu_wb_skipped" not in bind:
-        raise SystemExit("the queue gate is missing: a written binding must check the CPU-read pages")
+    # (rule 1: the drain drops a whole pool's write-backs where the CPU never looks - pool-level,
+    # never page-level - and the readback itself queues its range's copy and settles the evidence)
     end = block(mem, "void memory_end_submission(VkCommandBuffer cmd) {")
-    for needle in ("dgpu_clip_reads(*p, runs)", "const bool diff = !dgpu_on() && wb_diff_on()", "st_dgpu_wb_copied"):
+    for needle in ("dgpu_pool_writes_back(p->dgpu_read)", "st_dgpu_wb_skipped", "st_dgpu_wb_copied",
+                   "const bool diff = !dgpu_on() && wb_diff_on()"):
         if needle not in end:
-            raise SystemExit("the sparse write-back is missing in memory_end_submission: " + needle)
+            raise SystemExit("the pool-level write-back gate is missing in memory_end_submission: " + needle)
+    note = block(mem, "void memory_note_readback(uint64_t guest, uint64_t size) {")
+    for needle in ("p.dgpu_read = true, p.dgpu_wrote = true",
+                   "writebacks.push_back({&p, guest - p.lo, guest - p.lo + size})"):
+        if needle not in note:
+            raise SystemExit("the readback does not queue its own range / settle the evidence: " + needle)
     # (rule 2's promotion path: the classification decides, the stock mirror machinery applies it)
+    bind = block(mem, "BufferRef gpu_buffer_bind(uint64_t gpu, uint64_t size, bool written) {")
     if "dgpu_classify(" not in bind:
         raise SystemExit("gpu_buffer_bind does not classify through dgpu_classify")
     if "Pool::MIRROR_REFUSED" not in bind or "Pool::MIRROR_NONE" not in bind:
         raise SystemExit("the classification must land in the stock states (REFUSED direct, NONE to be made)")
-    # (the readbacks learn the pages even before the first write-back covered them, or the exposure
-    # meter would read zeros forever: the note runs ahead of the 'ever' gate only under the policy)
-    if "if (!off && dgpu_on()) memory_note_readback(" not in replay:
-        raise SystemExit("vk_replay does not note readbacks ahead of the write-back gate under the policy")
+    # (the readbacks learn the pool before the write-back gate could have covered it, and a GPU-written
+    # pool's first read waits for the copy-back stock's value cannot name yet)
+    if "if (policy) memory_note_readback(" not in replay or "memory_pool_gpu_written(host->gpu_guest(gpu), size)" not in replay:
+        raise SystemExit("vk_replay does not note readbacks / wait on the first read under the policy")
     # (the keep file lives where the game folder's other state lives: beside image.bin, vk_paths.h)
     keep = block(mem, "std::string dgpu_keep_path() {")
     if "game_module_path(" not in keep or "hookshot_dgpu_mirrors.txt" not in keep:
         raise SystemExit("the keep file must be built with game_module_path (the game folder's rule)")
-    # (the keep file's line format: a verdict letter and the pool's hex start, Triforce's bare hex read as 'M')
     loader = block(mem, "std::unordered_map<uint64_t, char>& dgpu_keep() {")
     for needle in ("strtoull", "'M'", "'D'", "fgets"):
         if needle not in loader:
@@ -87,27 +97,15 @@ def run_fixture(cxx, source):
     text = source.read_text(encoding="utf-8")
     classify = text[text.index("int dgpu_classify("):]
     classify = classify[:classify.index('\n}') + 2]
-    clip_start = text.index("void dgpu_clip_reads(")
-    clip = text[clip_start:text.index("\n}\n", clip_start) + 3]
+    gate_start = text.index("inline bool dgpu_pool_writes_back(")
+    gate = text[gate_start:text.index("\n}", gate_start) + 3]
     fixture = r'''
-#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
-#include <vector>
 #define CHECK(ok) do { if (!(ok)) { std::fprintf(stderr, "failed line %d: %s\n", __LINE__, #ok); std::exit(1); } } while (0)
-// (the policy's gate, as the fixture drives the ON side; the OFF side is the source check above)
-static bool dgpu_on() { return true; }
-constexpr int kPageShift = 12;
-struct VkBufferCopy { uint64_t srcOffset, dstOffset, size; };
-// (the Pool fields dgpu_clip_reads reads: the same names and types as the real struct's)
-struct Pool {
-    uint64_t lo = 0, hi = 0;
-    std::vector<uint64_t> dgpu_read;
-    uint32_t dgpu_read_n = 0;
-};
 namespace {
-''' + classify + clip + r'''
+''' + classify + gate + r'''
 } // namespace
 int main() {
     // (classification: static pools direct, GPU-written pools promoted, trials and verdicts held)
@@ -121,47 +119,12 @@ int main() {
     CHECK(dgpu_classify(2, true, false, char(0), false) == 0);    // (already mirrored: nothing to do)
     CHECK(dgpu_classify(3, false, true, char(0), false) == 0);    // (static and direct: stays)
     CHECK(dgpu_classify(1, false, false, char(0), false) == 0);   // (WANTED: stock's own machinery, left alone)
-    // (the clip: only the pages the CPU read go back, page-granular and re-merged, gaps never bridged)
-    {
-        Pool p;
-        p.lo = 0x1000000000;
-        p.hi = p.lo + (16u << 12) * 4096;   // (16 pages)
-        p.dgpu_read.assign(1, 0);
-        auto mark = [&](uint64_t page) { p.dgpu_read[page >> 6] |= 1ull << (page & 63); p.dgpu_read_n++; };
-        mark(1), mark(2);                   // (pages 1-2: one merged run)
-        mark(5);                            // (a gap, then page 5: a second run)
-        p.dgpu_read_n = 3;
-        std::vector<VkBufferCopy> runs = {{0, 0, 16u << 12}};   // (the whole pool queued)
-        dgpu_clip_reads(p, runs);
-        CHECK(runs.size() == 2);
-        CHECK(runs[0].srcOffset == 4096 && runs[0].size == 2 * 4096);   // (1-2 merged)
-        CHECK(runs[1].srcOffset == 5 * 4096 && runs[1].size == 4096);   // (5 alone: the gap stayed a gap)
-        // (a run wholly inside unread pages: nothing to copy)
-        std::vector<VkBufferCopy> none = {{3 * 4096, 3 * 4096, 4096}};
-        dgpu_clip_reads(p, none);
-        CHECK(none.empty());
-        // (a run that starts and ends mid-page keeps its own bytes on the kept page: the copy is the
-        // written range the queue carried, on the pages the CPU read, never a page more)
-        std::vector<VkBufferCopy> odd = {{4096 + 10, 4096 + 10, 100}};
-        dgpu_clip_reads(p, odd);
-        CHECK(odd.size() == 1 && odd[0].srcOffset == 4096 + 10 && odd[0].size == 100);
-        // (a run crossing an unread page into read ones: the unread part drops, the rest stays)
-        std::vector<VkBufferCopy> cross = {{3000, 3000, 8000}};   // (page 0 unread, pages 1-2 read)
-        dgpu_clip_reads(p, cross);
-        CHECK(cross.size() == 1 && cross[0].srcOffset == 4096 && cross[0].size == 8000 - (4096 - 3000));
-        // (no read pages at all: everything clears - the queue gate keeps these out anyway)
-        Pool q;
-        q.lo = p.lo, q.hi = p.hi;
-        std::vector<VkBufferCopy> all = {{0, 0, 4096}};
-        dgpu_clip_reads(q, all);
-        CHECK(all.empty());
-        // (two adjacent kept pages across a queued-run boundary merge back into one copy)
-        std::vector<VkBufferCopy> two = {{4096, 4096, 4096}, {2 * 4096, 2 * 4096, 4096}};
-        dgpu_clip_reads(p, two);
-        CHECK(two.size() == 1 && two[0].srcOffset == 4096 && two[0].size == 2 * 4096);
-    }
+    // (the write-back gate: all of a CPU-read pool's writes go back, none of an unread pool's - pool
+    // granularity, the measured safe shape: a page-level cull dropped the game's own reads of GPU results)
+    CHECK(dgpu_pool_writes_back(true));      // (a readback read it: whole pool coherent where the CPU looks)
+    CHECK(!dgpu_pool_writes_back(false));    // (never read: no copy, no diff, no wait - the sync that was cut)
     std::puts("PASS: gate defaults off at every site; classification direct/promote/verdicts/trial; "
-        "clip keeps only CPU-read pages, page-granular, gaps intact, merges neighbours");
+        "write-back gate pool-level: CPU-read pool kept whole, unread pool dropped whole");
 }
 '''
     with tempfile.TemporaryDirectory(prefix="dgpu-policy-") as tmp:

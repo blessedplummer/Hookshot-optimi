@@ -83,15 +83,19 @@ struct Pool {
     std::vector<uint64_t> shadow_known;   // (a bit a page)
     // ---- the dGPU policy (RX_VK_DGPU, off by default: every field inert while unset) ----
     // The PC-engine rule: a pool the GPU never writes needs no coherence copy at all (rule 2, direct-mapped), and a
-    // pool it does writes back only what the CPU is seen reading (rule 1, page-sparse). Classification is learned,
-    // never guessed: dgpu_wrote flips at the first written binding or stamped GPU write, so a pool starts static and
-    // is promoted the moment the GPU writes it (the promotion keeps stock's direct-write epoch guard, below).
+    // pool it does writes back only where the CPU looks (rule 1). Classification is learned, never guessed:
+    // dgpu_wrote flips at the first written binding or stamped GPU write, so a pool starts static and is promoted
+    // the moment the GPU writes it (the promotion keeps stock's direct-write epoch guard, below).
     bool dgpu_wrote = false;    // (rule 1) the GPU has written this pool: it belongs device-local with sparse sync
     bool dgpu_direct = false;   // (rule 2) policy put it in guest memory: no mirror, no sync, no write-back
     bool dgpu_trial = false;    // (rule 3) a mirror trial holds it: classification stands aside until the verdict
     uint8_t dgpu_trial_fails = 0;   // (rule 3) trials that ended without a verdict: two, and it is left alone
-    std::vector<uint64_t> dgpu_read;   // (rule 1) a bit a page: pages the CPU read of this pool's GPU results
-    uint32_t dgpu_read_n = 0;          // (and their count: the queue gate reads it per bind, never the bitmap)
+    // (rule 1) the CPU has read a page of this pool's GPU results (a readback: the NVN registry). Pool granularity
+    // on purpose - the game reads GPU results outside the readback API too (the replay's own record-time reads of
+    // indirect args and index data), and a page-sparse copy broke exactly that: with the copies skipped the same
+    // 4K scene issued 3941 draws against 1364 with them (deepseek's measurement, draw-count parity is the
+    // detector). Where the CPU looks, the whole pool's writes go back; where it never looks, none do.
+    bool dgpu_read = false;
 };
 uint64_t mem_rec_value = 0, mem_completed = 0;   // (the recording being made, and the GPU's progress)
 
@@ -475,7 +479,7 @@ bool dgpu_on() {
 }
 
 /// (dGPU) The policy's own counters, printed in the 600-submit stats block below
-int64_t st_dgpu_direct = 0, st_dgpu_promoted = 0, st_dgpu_wb_copied = 0, st_dgpu_wb_skipped = 0, st_dgpu_read_pages = 0;
+int64_t st_dgpu_direct = 0, st_dgpu_promoted = 0, st_dgpu_wb_copied = 0, st_dgpu_wb_skipped = 0, st_dgpu_read_pools = 0;
 /// (dGPU rule 2/1) The classification's decision for one pool, pure: mstate is Pool's own values (NONE 0, WANTED 1,
 /// ON 2, REFUSED 3). 1: direct-map it (static, no mirror); 2: promote it to a mirror (the GPU wrote it); 0: leave
 /// it. A running trial holds the pool where the trial put it, and a keep-file verdict ('M'/'D') is final for the
@@ -485,6 +489,14 @@ int dgpu_classify(uint8_t mstate, bool wrote, bool direct, char verdict, bool tr
     if (direct && wrote && verdict != 'D') return 2;
     if (!wrote && mstate == 0 && verdict != 'M') return 1;
     return 0;
+}
+/// (dGPU rule 1) Whether a pool's written ranges go back to guest memory: only where the CPU looks (its
+/// readbacks, the NVN registry). Pool granularity on purpose - the game reads GPU results outside the readback
+/// API too (the replay's own record-time reads), and a page-sparse copy broke exactly that: 3941 draws against
+/// 1364 with the copies skipped (deepseek's 4K measurement; draw-count parity is the detector). Where the CPU
+/// looks the whole pool is coherent; where it never looks, none of it crosses PCIe. cut by tests/test_dgpu_policy.py
+inline bool dgpu_pool_writes_back(bool read_by_cpu) {
+    return read_by_cpu;
 }
 /// (dGPU) GPU writes seen outside the bind path (memory_stamp_gpu), folded into the pools at the next submission
 std::mutex dgpu_writes_mu;
@@ -2491,30 +2503,37 @@ void memory_note_readback(uint64_t guest, uint64_t size) {
     static const bool off = getenv("RX_VK_NO_RB_REFRESH") != nullptr;
     if (off || !size || size > 0x4000) return;   // (small results only: meters and counters)
     std::lock_guard lk(pools_mu);
-    for (uint64_t pg = guest >> kPageShift; pg <= (guest + size - 1) >> kPageShift; pg++) rb_pages[(uint32_t)pg] = mirror_epoch;
-    // (dGPU policy, RX_VK_DGPU) The sparse write-back's set: every page the CPU is seen reading of a pool's GPU
-    // results. The clip at the submission's end copies back only these pages, so a buffer tens of MB wide that the
-    // CPU never touches (the culling lists and per-frame storage of issue #1629) stops crossing PCIe both ways for
-    // good - while a page first read now is learned even before any write-back covered it (vk_replay's note runs
-    // ahead of the "ever" gate under the policy), which is what keeps the exposure meter out of stale-by-forever.
-    // Indexed from the pool's own start: a 1 GB pool's bitmap is 32 KB, not its guest page number's.
-    if (dgpu_on() && guest) {
+    // (dGPU policy, rule 1) The pool-level evidence: the CPU reads this pool's GPU results, so its written ranges
+    // go back to guest memory (the drain's gate below) - and the readback range itself is queued for this
+    // submission's copy right now, because a readback range need not be part of a written binding, and stock's
+    // wait for it needs a write-back value only a copy can give (deepseek's measured fix, credited). A readback
+    // reads GPU results by definition, so it also settles dgpu_wrote: a stamp still folded in at the next
+    // submission cannot leave the first read of a pool unwritten-back.
+    if (dgpu_on()) {
         auto it = imported.upper_bound(guest);
         if (it != imported.begin()) {
             --it;
             Pool& p = it->second;
             if (guest >= p.lo && guest < p.hi) {
-                const uint64_t base = p.lo >> kPageShift;
-                const uint64_t first = guest >> kPageShift, last = std::min((guest + size - 1) >> kPageShift, (p.hi - 1) >> kPageShift);
-                if (p.dgpu_read.size() < (size_t)(((last - base) >> 6) + 1)) p.dgpu_read.resize((size_t)(((last - base) >> 6) + 1), 0);
-                for (uint64_t pg = first; pg <= last; pg++) {
-                    const uint64_t w = 1ull << ((pg - base) & 63);
-                    if (!(p.dgpu_read[(pg - base) >> 6] & w))
-                        p.dgpu_read[(pg - base) >> 6] |= w, p.dgpu_read_n++, st_dgpu_read_pages++;
-                }
+                const bool fresh = !p.dgpu_read;
+                p.dgpu_read = true, p.dgpu_wrote = true;
+                if (fresh) st_dgpu_read_pools++;
+                if (p.mstate == Pool::MIRROR_ON && p.mirror && mirror_upload && size <= p.hi - guest)
+                    writebacks.push_back({&p, guest - p.lo, guest - p.lo + size});
             }
         }
     }
+    for (uint64_t pg = guest >> kPageShift; pg <= (guest + size - 1) >> kPageShift; pg++) rb_pages[(uint32_t)pg] = mirror_epoch;
+}
+/// (dGPU policy) The readback first-read answer (vk_replay): the pool holding this range is one the GPU writes, so
+/// the read waits for the submission that ends with its copy-back - stock's write-back value says nothing yet
+bool memory_pool_gpu_written(uint64_t guest, uint64_t size) {
+    if (!dgpu_on() || !size) return false;
+    std::lock_guard lk(pools_mu);
+    auto it = imported.upper_bound(guest);
+    if (it == imported.begin()) return false;
+    --it;
+    return guest >= it->second.lo && size <= it->second.hi - guest && it->second.dgpu_wrote;
 }
 // (dGPU policy) The GPU has written [guest, guest + size): the pool holding it leaves the static class (pools_mu
 // held). Classification only - direct mapping stays coherent however late this lands, so a miss costs an optimal
@@ -2887,18 +2906,10 @@ BufferRef gpu_buffer_bind(uint64_t gpu, uint64_t size, bool written) {
             if (kb) logf("vk: write-backs only of written bindings up to %llu KB (RX_VK_WB_MAX_KB)", (unsigned long long)kb);
             return kb << 10;
         }();
-        if (!wb_max || size <= wb_max) {
-            // (dGPU policy, rule 1) The sparse write-back: a written binding queues a copy back only when the CPU has
-            // been seen reading this pool's GPU results at all (dgpu_read_n, learned at the readbacks in
-            // memory_note_readback). A pool nothing reads back - the culling lists and per-frame storage of issue
-            // #1629, tens of MB a frame - queues nothing, and what a pool that is read back queues is clipped to
-            // those very pages at the submission's end. Direct-mapped pools never reach here: their writes landed in
-            // guest memory and need no copy.
-            if (!dgpu_on() || p->dgpu_read_n)
-                writebacks.push_back({p, off, std::min(off + size, p->hi - p->lo)});
-            else
-                st_dgpu_wb_skipped += (int64_t)size;
-        }
+        if (!wb_max || size <= wb_max)
+            // (dGPU policy, rule 1: queue everything as stock - the drop is at the submission's end, where a
+            // readback recorded after this bind has already been counted: the gate is the pool's own dgpu_read)
+            writebacks.push_back({p, off, std::min(off + size, p->hi - p->lo)});
         rb_hazard_locked(p->lo + off, p->lo + std::min(off + size, p->hi - p->lo));   // (memory_rb_refresh)
     }
     return remember({p->mirror, off, size, 0});
@@ -3860,40 +3871,6 @@ WbdTable* wbd_table_get(uint64_t bytes) {
     return &t;
 }
 
-// (dGPU policy, rule 1) The sparse write-back's clip: of a written binding's merged runs, only the pages the CPU
-// has been seen reading of this pool (dgpu_read, learned at the readbacks) go back to guest memory. Page-granular
-// and re-merged, so a meter's pages are one small copy and a culling list the CPU never touches is no copy at all:
-// this is the "sync sparsely, never mirrored whole" of the policy - the whole-pool writes of the diff pass were
-// the 3344.4 MB compared every 600 submits. Empty on return: nothing this pool wrote is CPU-read, so nothing is
-// copied, noted or waited for. (The queue gate already keeps unread pools out; this clips what is in flight.)
-void dgpu_clip_reads(Pool& p, std::vector<VkBufferCopy>& runs) {
-    if (!dgpu_on()) return;
-    if (runs.empty() || !p.dgpu_read_n || p.dgpu_read.empty()) {
-        runs.clear();
-        return;
-    }
-    const uint64_t base = p.lo >> kPageShift;
-    std::vector<VkBufferCopy> out;
-    out.reserve(runs.size());
-    for (const VkBufferCopy& r : runs) {
-        uint64_t at = r.srcOffset;   // (srcOffset == dstOffset: offsets in the pool, as the merges built them)
-        const uint64_t end = r.srcOffset + r.size;
-        while (at < end) {
-            const uint64_t pg = (p.lo + at) >> kPageShift;
-            const uint64_t page_end = std::min<uint64_t>(((pg + 1) << kPageShift) - p.lo, end);
-            const uint64_t word = (pg - base) >> 6;
-            if (word < p.dgpu_read.size() && (p.dgpu_read[word] & (1ull << ((pg - base) & 63)))) {
-                if (!out.empty() && out.back().dstOffset + out.back().size == at)
-                    out.back().size += page_end - at;
-                else
-                    out.push_back({at, at, page_end - at});
-            }
-            at = page_end;
-        }
-    }
-    runs.swap(out);
-}
-
 void memory_end_submission(VkCommandBuffer cmd) {
     std::lock_guard lk(pools_mu);
     {   // (every 600 submissions: how the mirror syncs' dirty pages were read)
@@ -3914,11 +3891,11 @@ void memory_end_submission(VkCommandBuffer cmd) {
             st_wbd_runs = st_wbd_bytes = st_wbd_fill_pages = 0;
             st_wbd_known_game = st_wbd_known_collected = st_wbd_known_replay = 0;
             if (dgpu_on()) {   // (the policy's own 600-submit line: what rule 1 saved and rules 2/3 decided so far)
-                logf("vk: dGPU policy (600 submits): write-backs %.1f MB copied, %.1f MB not queued or clipped away; "
-                     "%lld pools direct-mapped, %lld promoted to mirrors, %lld CPU-read pages learned; "
-                     "%lld trials, %lld verdicts kept",
+                logf("vk: dGPU policy (600 submits): write-backs %.1f MB copied for CPU-read pools, %.1f MB dropped "
+                     "for pools the CPU never reads; %lld pools direct-mapped, %lld promoted to mirrors, "
+                     "%lld pools learned as CPU-read; %lld trials, %lld verdicts kept",
                      st_dgpu_wb_copied / 1048576.0, st_dgpu_wb_skipped / 1048576.0, (long long)st_dgpu_direct,
-                     (long long)st_dgpu_promoted, (long long)st_dgpu_read_pages, (long long)st_dgpu_trials,
+                     (long long)st_dgpu_promoted, (long long)st_dgpu_read_pools, (long long)st_dgpu_trials,
                      (long long)st_dgpu_kept);
                 st_dgpu_wb_copied = st_dgpu_wb_skipped = 0;
             }
@@ -3999,13 +3976,13 @@ void memory_end_submission(VkCommandBuffer cmd) {
                     runs.push_back({w.lo, w.lo, w.hi - w.lo});
             }
             cut_cpu_words(*p, runs);
-            if (dgpu_on()) {   // (rule 1: of what is queued, only the pages the CPU is seen reading)
-                uint64_t before = 0;
-                for (const VkBufferCopy& r : runs) before += r.size;
-                dgpu_clip_reads(*p, runs);
-                uint64_t after = 0;
-                for (const VkBufferCopy& r : runs) after += r.size;
-                st_dgpu_wb_copied += (int64_t)after, st_dgpu_wb_skipped += (int64_t)(before - after);
+            if (dgpu_on()) {   // (rule 1, pool-level: where the CPU never looks, none of the pool's writes go back)
+                if (dgpu_pool_writes_back(p->dgpu_read)) {
+                    for (const VkBufferCopy& r : runs) st_dgpu_wb_copied += (int64_t)r.size;
+                } else {
+                    for (const VkBufferCopy& r : runs) st_dgpu_wb_skipped += (int64_t)r.size;
+                    runs.clear();
+                }
             }
             if (runs.empty()) continue;
             checkpoint_mark(cmd, p->lo, 'b');

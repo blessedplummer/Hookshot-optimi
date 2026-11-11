@@ -2284,14 +2284,16 @@ void invalidate(uint64_t gpu, uint64_t size) {
     if (size) {
         static const bool off = getenv("RX_VK_NO_READBACK_WAIT") != nullptr;
         bool ever = false;
-        // (dGPU policy, RX_VK_DGPU) The note first, before the "ever had a write-back" gate: the sparse write-back
-        // copies only the pages the CPU is seen reading, so a page no write-back ever covered would never be learned
-        // and would stay un-copied for the whole run (the exposure meter would read zeros forever). Learning the page
-        // here is what lets the submission's write-back include it from now on; the wait below is unchanged and still
-        // runs only when a write-back ever covered the range.
-        if (!off && dgpu_on()) memory_note_readback(host->gpu_guest(gpu), size);
-        if (!off && (memory_writeback_value(host->gpu_guest(gpu), size, &ever), ever)) {
-            memory_note_readback(host->gpu_guest(gpu), size);   // (PR 430: the CPU may write it back: memory_rb_refresh)
+        // (dGPU policy, RX_VK_DGPU) The note runs ahead of the "ever had a write-back" gate: the policy's gate for
+        // copying a pool back is its own readback evidence, so a pool no copy ever covered would never be learned
+        // and never copied back (the exposure meter would read zeros forever). The note also queues that readback
+        // range's own copy for this submission. The wait then enters for a GPU-written pool even before a
+        // write-back value exists (the first-read wait); stock's machinery waits where it has a value, as before.
+        const bool policy = !off && dgpu_on();
+        if (policy) memory_note_readback(host->gpu_guest(gpu), size);
+        if (!off && (memory_writeback_value(host->gpu_guest(gpu), size, &ever),
+                     ever || (policy && memory_pool_gpu_written(host->gpu_guest(gpu), size)))) {
+            if (!policy) memory_note_readback(host->gpu_guest(gpu), size);   // (PR 430: the CPU may write it back: memory_rb_refresh)
             static std::atomic<int64_t> calls{0}, waited{0}, ns{0};
             const auto w0 = std::chrono::steady_clock::now();
             bool w = false;
