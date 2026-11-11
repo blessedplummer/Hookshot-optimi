@@ -81,27 +81,26 @@ struct Trial {
 // The verdict: the mirror keeps the pool only when it is clearly faster, a gain both in percent and in
 // milliseconds, so a noise-level 1% win does not buy a pool a mirror and the sync around it for good. The knobs
 // (RX_VK_DGPU_GAIN, a percent, 10; RX_VK_DGPU_FLOOR, ms, 0.25) are read in vk_memory.cpp and passed here, so this
-// stays pure. Why both: the percent alone keeps a mirror for 0.05 ms of 5 (noise), the floor alone for 0.25 ms of
-// 20 (nothing a frame would miss); together they say "a real share of the frame, and more than the sync it costs".
+// stays pure. Why both, as whichever is larger: the percent alone keeps a mirror for 0.05 ms of 5 (noise), the
+// floor alone for 0.25 ms of 20 (nothing a frame would miss) - and neither should gate the other: 1.09 ms saved
+// of a 10.32 ms frame (10.6%) is a real win at the 10% knob even though it is under 10% + 0.25 ms. Measured in
+// the game: that pool's verdict is in the race's logs. The window's own noise (a load, a menu) is held off by the
+// caller, which starts a trial only on a sane baseline.
 inline bool mirror_worth(double direct_ms, double mirror_ms, double gain_pct, double floor_ms) {
-    return mirror_ms + floor_ms < direct_ms * (1.0 - gain_pct / 100.0);
+    const double saved = direct_ms - mirror_ms;
+    return saved > direct_ms * gain_pct / 100.0 && saved > floor_ms;
 }
 
-// A trial candidate: read bytes were gathered in guest memory this window (the GPU carried them over PCIe), the
-// pool is not write-dominated (its writes went through guest memory too: a pool the GPU renders into lives best
-// where it is, its writes land in the pool the CPU reads, and out of the mirrors such pools cost only GPU write
-// time - Triforce measured ~1 ms a frame and no gain, while a mirror would buy the write-back's diff back), not
-// tried before (one trial a pool: a scene change can fool one, but a stutter a load repeats is worse), and still
-// imported (a retired pool's range is another pool's now).
-inline bool candidate(bool tried, bool write_dominated, bool mirrored, bool imported) {
-    return imported && !tried && !mirrored && !write_dominated;
+// A trial candidate, by its window: enough guest-memory reads to be worth measuring (a pool the GPU barely reads
+// would only ever measure noise, and its verdict would follow the pool for good in the skip list), and not
+// write-dominated (its writes went through guest memory too: a pool the GPU renders into lives best where it is,
+// its writes land in the pool the CPU reads, and out of the mirrors such pools cost only GPU write time -
+// Triforce measured ~1 ms a frame and no gain, while a mirror would buy the write-back's diff back). One
+// megabyte a window, of the several hundred MB a heavy pool gathers: above the noise, under everything real.
+// The caller has already filtered retired pools and pools tried before.
+inline bool trial_candidate(uint64_t read_bytes, uint64_t wrote_bytes) {
+    return read_bytes >= (1ull << 20) && wrote_bytes < read_bytes;
 }
-
-// What a binding syncs, by where the pool is bound. In guest memory: nothing - the GPU reads and writes the pool
-// where it is, and the CPU sees its writes once the submission is done, the same ordering the write-back gave.
-// Only a mirrored pool syncs (its mirror_sync at a submission's start, its write-backs at the end, the stock
-// machinery around its mirror). "Sync sparsely" taken to its end: the pages a CPU never reads are synced never.
-inline bool pool_syncs(bool mirrored) { return mirrored; }
 
 // A skip-list line: one hex pool start, one a line, as Triforce's keep list keeps them; anything from '#' on is a
 // note. False for a blank or commented line, so the reader skips it without stopping.

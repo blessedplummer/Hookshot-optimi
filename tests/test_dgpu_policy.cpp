@@ -30,28 +30,26 @@ int main() {
     CHECK(t.phase == P::Idle);   // (the verdict is the caller's, the trial already idle)
     CHECK(t.mirror_ms == 1.5);   // (180e6 over 120 frames)
 
-    // ---- the verdict: a gain in percent AND in milliseconds, one knob alone is not a verdict ----
-    CHECK(mirror_worth(2.0, 1.5, 10.0, 0.25));        // (25% and 0.5 ms: keeps it)
-    CHECK(!mirror_worth(2.0, 1.85, 10.0, 0.25));      // (7.5%: under the gain, however it reads in ms)
-    CHECK(!mirror_worth(20.0, 19.6, 10.0, 0.25));     // (2% of a long frame: under both)
+    // ---- the verdict: a gain in percent AND in milliseconds, whichever asks more ----
+    CHECK(mirror_worth(2.0, 1.5, 10.0, 0.25));        // (25% and 0.5 ms saved: over both)
+    CHECK(!mirror_worth(2.0, 1.85, 10.0, 0.25));      // (7.5% and 0.15 ms: under both)
+    CHECK(!mirror_worth(20.0, 19.6, 10.0, 0.25));     // (2% and 0.4 ms of a long frame: the percent says no)
     CHECK(mirror_worth(20.0, 16.0, 10.0, 0.25));      // (20% and 4 ms: keeps it)
+    CHECK(mirror_worth(10.32, 9.23, 10.0, 0.25));     // (the measured case: 10.6% and 1.09 ms, both over the line;
+                                                      //   the additive form wrongly refused this one)
     CHECK(!mirror_worth(2.0, 1.79, 10.0, 0.25));      // (10.5% but 0.21 ms: under the floor)
-    CHECK(mirror_worth(2.0, 1.54, 10.0, 0.25));       // (23% and 0.46 ms: keeps it)
-    CHECK(!mirror_worth(2.0, 1.70, 10.0, 0.25));      // (15% but 0.30 ms: 1.95 is over the 1.8 the gain asks)
+    CHECK(mirror_worth(2.0, 1.70, 10.0, 0.25));       // (15% and 0.30 ms: over both)
     CHECK(!mirror_worth(2.0, 2.0, 10.0, 0.25));       // (no faster: no)
+    CHECK(!mirror_worth(2.0, 1.99, 10.0, 0.25));      // (0.5% and 0.01 ms: under both)
     CHECK(mirror_worth(2.0, 1.7, 0.0, 0.25));         // (gain 0: the floor alone can still say yes)
     CHECK(!mirror_worth(2.0, 1.79, 0.0, 0.25));
+    CHECK(mirror_worth(2.0, 1.74, 10.0, 0.25));       // (13% and 0.26 ms: over both, kept)
 
-    // ---- a candidate: imported, untried, unmirrored, not write-dominated ----
-    CHECK(candidate(false, false, false, true));
-    CHECK(!candidate(true, false, false, true));       // (one trial a pool)
-    CHECK(!candidate(false, true, false, true));       // (the GPU writes it as much as it reads: render target)
-    CHECK(!candidate(false, false, true, true));       // (mirrored already)
-    CHECK(!candidate(false, false, false, false));     // (retired: its range is another pool's)
-
-    // ---- what a binding syncs, by where the pool is bound ----
-    CHECK(!pool_syncs(false));   // (in guest memory: nothing copied, nothing compared)
-    CHECK(pool_syncs(true));     // (mirrored: the stock sync around its mirror)
+    // ---- a candidate, by its window: reads above the noise floor, not write-dominated ----
+    CHECK(trial_candidate(2'000'000, 0));             // (2 MB read, none written)
+    CHECK(!trial_candidate(500'000, 0));              // (under 1 MB: noise, and its verdict would follow it for good)
+    CHECK(!trial_candidate(2'000'000, 2'000'000));    // (wrote at least what it read: render target)
+    CHECK(!trial_candidate(2'000'000, 3'000'000));
 
     // ---- a skip-list line: one hex start, one a line, '#' a note ----
     uint64_t lo = 0;
