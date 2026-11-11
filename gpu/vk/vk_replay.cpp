@@ -286,6 +286,12 @@ void vk_timeline_wait(uint64_t v) {   // (at most 250 ms: a submission held back
         if (logged++ < 8) logf("vk: a capture's wait for write-back %llu timed out (done %llu)", (unsigned long long)v, (unsigned long long)completed());
     }
 }
+// (hookshot, RX_VK_DGPU) the GPU time the recordings collected so far, in ns, never reset: the dGPU policy's trials
+// (vk_memory.cpp dgpu_trials) measure a pool in guest memory against its mirror from it. st_gpu_ns itself is reset by
+// the 120-frame status line; the trials' deltas must not see that. At this file's outer namespace: vk_internal.h
+// declares it, vk_memory.cpp calls it, and an anonymous namespace here would leave it unresolved at the link
+int64_t gpu_ns_total = 0;
+int64_t gpu_time_total_ns() { return gpu_ns_total; }
 namespace {
 
 int64_t st_wait_ns;   // (time the replay waited for a recording slot: the GPU behind)
@@ -295,8 +301,6 @@ int64_t st_wait_ns;   // (time the replay waited for a recording slot: the GPU b
 VkQueryPool ts_pool = VK_NULL_HANDLE;
 bool ts_pending[kRecordings];
 int64_t st_gpu_ns, st_gpu_max_ns;
-int64_t gpu_ns_total = 0;   // (gpu_time_total_ns: never reset, unlike st_gpu_ns above)
-int64_t gpu_time_total_ns() { return gpu_ns_total; }
 void gpu_time_collect(Recording& r) {
     if (!ts_pool || !ts_pending[r.slot]) return;
     ts_pending[r.slot] = false;
