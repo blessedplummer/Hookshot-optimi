@@ -104,15 +104,17 @@ def check_source():
           "if (++p->dgpu_aborts >= 3) {",
           "p->dgpu_done = true;",
           "dgpu_trial.base_binds = p->dgpu_binds;",
-          # (the scene's snapshot at the mirror phase: the other pools the trailing window bound meaningfully -
-          # compared as a set at the verdict, a scene change swaps them, a working mirror does not)
+          # (the scene's snapshot at the mirror phase: the guest ranges of every other pool the trailing window
+          # bound meaningfully - matched by overlap at the verdict, so an allocator recycling a range under a new
+          # pool id is the same anchor, and only a substantial fraction moving voids)
           "dgpu_scene.clear();",
-          "sp.dgpu_binds >= kSceneBinds",
-          # (the two windows must have measured the same scene and workload: the set moved, or the trial pool's own
-          # bind count - counted on every path, the mirror's included - moved over 2x either way. The volume alone,
-          # guest-served, was the old check's livelock: it voided every trial the mirror would win)
-          "dgpu::ab_voided(dgpu_trial.base_binds, p->dgpu_binds, scene_moved + scene_new)",
-          "size_t scene_moved = 0, scene_new = 0;",
+          "sp.dgpu_binds >= kAnchorBinds",
+          "dgpu::anchor_hit(slo, sp.hi, dgpu_scene.data(), dgpu_scene.size())",
+          # (the two windows must have measured the same scene and workload: a substantial fraction of the anchors
+          # moved, or the trial pool's own bind count - counted on every path, the mirror's included - moved over 2x
+          # either way. The guest-served volume alone was the first check's livelock; the exact-id set was the
+          # second's - 1-2 streaming anchors voided every gameplay trial)
+          "dgpu::ab_voided(dgpu_trial.base_binds, p->dgpu_binds, anchors_changed, dgpu_scene.size())",
           # (three no-verdict endings - voids and settle give-ups share the count - and the pool sits out the session)
           "++p->dgpu_aborts >= 3",
           # (the settle-turned-measure counts the after window's binds from zero)
@@ -164,8 +166,10 @@ def check_source():
     need("vk_memory.cpp: dgpu_floor_ms()", block(mem, "double dgpu_floor_ms() {"), ['getenv("RX_VK_DGPU_FLOOR")'])
     # (documented where the surrounding switches are)
     need("docs/development.md: the GPU switches", docs,
-         ["`RX_VK_DGPU=1`", "`hookshot_mirror_skip.txt`", "`RX_VK_DGPU_TRIALS=0`", "at least 1 MB of it in guest memory",
-          "present-to-present", "issue 1795", "device and driver", "RX_VK_PARALLEL runs the policy trial-less"])
+         ["`RX_VK_DGPU=1`", "`hookshot_mirror_skip.txt`", "`RX_VK_DGPU_TRIALS=0`",
+          "at least 256 MB of it in guest memory",
+          "present-to-present", "issue 1795", "device and driver", "RX_VK_PARALLEL runs the policy trial-less",
+          "guest-range overlap"])
 
 
 def main():

@@ -2795,14 +2795,16 @@ void dgpu_skip_add(uint64_t lo) {
 // to A/B the trials apart from the policy).
 int64_t st_dgpu_trials = 0, st_dgpu_promoted = 0, st_dgpu_released = 0;
 dgpu::Trial dgpu_trial;
-// (the trial's scene: the pools the Base window bound meaningfully, snapshotted when the mirror phase begins and
-// compared with the trailing window's set at the verdict - dgpu::ab_voided. A working mirror does not touch it: the
-// pools that bind still bind, whatever serves their reads. A scene change swaps pools in and out of it)
-std::vector<uint64_t> dgpu_scene;
-// a pool is part of the scene from 64 binds of a trailing ~600-submit window (some 2 s): a pool the scene really
-// uses binds hundreds to thousands of times, and a marginal pool that straddles a lower line would flicker in and
-// out of the set across windows and void trials that measured the same scene (seen at the title screen at 16)
-constexpr uint64_t kSceneBinds = 64;
+// (the trial's scene: the guest ranges of the pools the Base window bound meaningfully, snapshotted when the mirror
+// phase begins and matched by overlap at the verdict - dgpu::ab_voided with dgpu::anchor_hit. Anchored by range, not
+// by id: the allocator recycles ranges under new pool ids (measured 0x109a rebinding as 0x7fd3 with binds stable) and
+// a recycle is the scene's same pool. A working mirror does not move the set: the pools that bind still bind,
+// whatever serves their reads)
+std::vector<dgpu::Anchor> dgpu_scene;
+// a pool anchors the scene from 256 binds of a trailing ~600-submit window (some 2 s) - four times the first floor
+// tried (64): pools near that line are Hyrule Field's streaming guests, 1-2 crossing it every window (measured, and
+// they voided every trial), while the scene's real pools bind hundreds to thousands of times
+constexpr uint64_t kAnchorBinds = 256;
 double dgpu_gain_pct() {
     // (a number, not an on/off switch: env_int's rule in double form; unset, empty or not a number: the default)
     static const double v = getenv("RX_VK_DGPU_GAIN") && *getenv("RX_VK_DGPU_GAIN") ? atof(getenv("RX_VK_DGPU_GAIN")) : 10.0;
@@ -3648,12 +3650,13 @@ void dgpu_trials() {
                                  // and a copy recorded here would land behind the submission that closes this one)
         p->mstate = Pool::MIRROR_NONE;   // (out of the policy's refused state, or the make at its binding is never reached)
         dgpu_trial.base_binds = p->dgpu_binds;   // (the after window's bind volume is compared with it at the verdict)
-        // (the scene's snapshot: every other pool the trailing window bound meaningfully - the trial pool is the
-        // volume guard's subject, not a set member. Compared at the verdict: a scene change swaps pools in and out
-        // of the set; a working mirror leaves it alone, whatever it now serves)
+        // (the scene's snapshot: the guest ranges of every other pool the trailing window bound meaningfully - the
+        // trial pool is the volume guard's subject, not an anchor. Matched by overlap at the verdict: a scene change
+        // moves most anchors to other ranges; a working mirror leaves them all alone, whatever it now serves, and a
+        // recycled range under a new id is the same anchor)
         dgpu_scene.clear();
         for (const auto& [slo, sp] : imported)
-            if (slo != dgpu_trial.lo && sp.dgpu_binds >= kSceneBinds) dgpu_scene.push_back(slo);
+            if (slo != dgpu_trial.lo && sp.dgpu_binds >= kAnchorBinds) dgpu_scene.push_back({slo, sp.hi});
         logf("vk: dGPU trial %#llx (%llu MB): %.2f ms a frame in guest memory; its mirror made at its next binding",
              (unsigned long long)p->lo, (unsigned long long)((p->hi - p->lo) >> 20), dgpu_trial.direct_ms);
         break;
@@ -3663,24 +3666,29 @@ void dgpu_trials() {
         const double direct = dgpu_trial.direct_ms, mirrored = dgpu_trial.mirror_ms;
         dgpu_trial.stop();
         if (!p) break;   // (retired while measured: no verdict to keep)
-        // (the two windows must have measured the same scene and the same workload on it: the pools the windows
-        // bound are compared as a set - a scene change swaps them, a working mirror does not, whatever it now
-        // serves - and the trial pool's own bind count, counted on every path, must sit within two times of the
-        // before window's (a menu, a LOD switch). Either one voids the A/B: release the mirror, no verdict, no
-        // skip line. What this must never read as drift is the mirror serving the pool's reads - that collapse
-        // (12420 before, 180 after, measured) was the old check voiding every trial the mirror would win, 40+
-        // a run, forever. Three no-verdict endings, voids and settle give-ups together, and the pool sits out the
+        // (the two windows must have measured the same scene and the same workload on it. The scene: the anchors'
+        // guest ranges are matched by overlap, and only a SUBSTANTIAL fraction moving voids - Hyrule Field moves
+        // 1-2 anchors a window as it streams (measured: "1 pools left the scene, 2 entered" on every void, 15 a
+        // run), a real scene change moves most of them. The workload: the trial pool's own bind count, counted on
+        // every path, within two times of the before window's (a menu, a LOD switch). Either one voids the A/B:
+        // release the mirror, no verdict, no skip line. What this must never read as drift is the mirror serving
+        // the pool's reads - that collapse (12420 before, 180 after, measured) was the first check's livelock, and
+        // the per-path counting keeps it out. A drift that does not void here is retried with a fresh snapshot at
+        // the next trial; three no-verdict endings - voids and settle give-ups together - and the pool sits out the
         // session: the churn must not repeat even where detection is imperfect)
-        size_t scene_moved = 0, scene_new = 0;
-        for (uint64_t slo : dgpu_scene) {
-            const Pool* sp = dgpu_pool_at(slo);
-            if (!sp || sp->dgpu_binds < kSceneBinds) scene_moved++;   // (out of the set: retired, or gone quiet)
+        size_t anchors_changed = 0;
+        for (const auto& [slo, sp] : imported) {
+            if (slo == dgpu_trial.lo || sp.dgpu_binds < kAnchorBinds) continue;
+            if (!dgpu::anchor_hit(slo, sp.hi, dgpu_scene.data(), dgpu_scene.size())) anchors_changed++;   // (entered)
         }
-        for (const auto& [slo, sp] : imported)
-            if (slo != dgpu_trial.lo && sp.dgpu_binds >= kSceneBinds &&
-                std::find(dgpu_scene.begin(), dgpu_scene.end(), slo) == dgpu_scene.end())
-                scene_new++;   // (new in the set)
-        if (dgpu_trial.base_binds && dgpu::ab_voided(dgpu_trial.base_binds, p->dgpu_binds, scene_moved + scene_new)) {
+        for (const dgpu::Anchor& a : dgpu_scene) {
+            bool hit = false;
+            for (const auto& [slo, sp] : imported)
+                if (slo != dgpu_trial.lo && sp.dgpu_binds >= kAnchorBinds && slo < a.hi && a.lo < sp.hi) { hit = true; break; }
+            if (!hit) anchors_changed++;   // (left: retired, gone quiet, or recycled beyond overlap)
+        }
+        if (dgpu_trial.base_binds &&
+            dgpu::ab_voided(dgpu_trial.base_binds, p->dgpu_binds, anchors_changed, dgpu_scene.size())) {
             if (p->mstate == Pool::MIRROR_ON) mirror_free(*p);
             const auto wanted = std::find(mirror_wanted.begin(), mirror_wanted.end(), p);
             if (wanted != mirror_wanted.end()) mirror_wanted.erase(wanted);
@@ -3693,9 +3701,9 @@ void dgpu_trials() {
                      (unsigned long long)((p->hi - p->lo) >> 20), p->dgpu_aborts);
             } else
                 logf("vk: dGPU trial %#llx (%llu MB): the A/B's windows moved apart (%lld before, %lld after binds; "
-                     "%zu pools left the scene, %zu entered) - void, no verdict, tried again later",
+                     "%zu of %zu scene anchors changed) - void, no verdict, tried again later",
                      (unsigned long long)p->lo, (unsigned long long)((p->hi - p->lo) >> 20),
-                     (long long)dgpu_trial.base_binds, (long long)p->dgpu_binds, scene_moved, scene_new);
+                     (long long)dgpu_trial.base_binds, (long long)p->dgpu_binds, anchors_changed, dgpu_scene.size());
             break;
         }
         p->dgpu_done = true;

@@ -53,24 +53,41 @@ int main() {
     CHECK(!mirror_worth(2.0, 1.79, 0.0, 0.25));
     CHECK(mirror_worth(2.0, 1.74, 10.0, 0.25));       // (13% and 0.26 ms: over both, kept)
 
-    // ---- a candidate, by its window: reads above the noise floor, not write-dominated ----
-    CHECK(trial_candidate(2'000'000, 0));             // (2 MB read, none written)
-    CHECK(!trial_candidate(500'000, 0));              // (under 1 MB: noise, and its verdict would follow it for good)
-    CHECK(!trial_candidate(2'000'000, 2'000'000));    // (wrote at least what it read: render target)
-    CHECK(!trial_candidate(2'000'000, 3'000'000));
+    // ---- a candidate, by its window: reads that could pay for the verdict's floor, not write-dominated ----
+    CHECK(trial_candidate(6764ull << 20, 0));         // (the measured heavyweight: 6.7 GB a window of reads)
+    CHECK(!trial_candidate(2'000'000, 0));            // (the measured marginal: 2 MB a window on a 48 MB pool began
+                                                      //   three times a run and could never win - no verdict is
+                                                      //   reachable below the floor's time budget)
+    CHECK(trial_candidate(256ull << 20, 0));          // (the floor itself: in)
+    CHECK(!trial_candidate((256ull << 20) - 1, 0));   // (a byte under it: out)
+    CHECK(!trial_candidate(2'000'000'000, 2'000'000'000));   // (wrote at least what it read: render target)
+    CHECK(!trial_candidate(2'000'000'000, 3'000'000'000));
 
-    // ---- the A/B's validity: the scene's pool set and the trial pool's own bind volume, counted on every serving
-    // path (the mirror's included) - so the mirror working can never read as the workload moving ----
-    CHECK(!ab_voided(12420, 12420, 0));   // (the measured scene, honestly counted: the mirror serves the reads and
-                                          //   the binds continue - the old check read the same scene's collapse,
-                                          //   12420 -> 180 of guest-served binds, as drift and voided 40+ trials
-                                          //   a run; the caller now counts the mirror's binds, so the collapse
-                                          //   never reaches this function)
-    CHECK(!ab_voided(1000, 1900, 0));     // (1.9x: under the line)
-    CHECK(ab_voided(1000, 2500, 0));      // (2.5x the binds: a menu or a LOD switch moved the workload)
-    CHECK(ab_voided(1000, 300, 0));       // (honestly 3x down: the workload moved, void even with the same pools)
-    CHECK(ab_voided(1000, 1000, 1));      // (one pool entered or left the scene: a scene change voids at any volume)
-    CHECK(!ab_voided(16, 16, 0));
+    // ---- the scene's anchors: matched by guest-range overlap, not by pool id ----
+    dgpu::Anchor anchors[] = {{0x1000'0000ull, 0x2000'0000ull}, {0x4000'0000ull, 0x4100'0000ull}};
+    CHECK(anchor_hit(0x1080'0000ull, 0x1180'0000ull, anchors, 2));   // (a recycled range: the allocator re-imported
+                                                                     //   the first anchor's memory as a new pool at a
+                                                                     //   shifted, smaller size - the same anchor)
+    CHECK(anchor_hit(0x1000'0000ull, 0x2000'0000ull, anchors, 2));   // (the same pool, same range)
+    CHECK(!anchor_hit(0x3000'0000ull, 0x3800'0000ull, anchors, 2));  // (a genuinely different range: a new scene's pool)
+    CHECK(!anchor_hit(0x4100'0000ull, 0x4200'0000ull, anchors, 2));  // (touching, not overlapping)
+
+    // ---- the A/B's validity: a substantial fraction of the anchors moved, or the trial pool's own bind volume -
+    // counted on every serving path (the mirror's included) - moved over 2x. Straddlers do not void ----
+    CHECK(!ab_voided(24000, 24000, 0, 30));    // (the measured scene, honestly counted: the mirror serves the reads
+                                               //   and the binds continue)
+    CHECK(!ab_voided(24000, 24000, 1, 30));    // (one anchor moved of 30: a streaming guest - measured "1 pools left
+                                               //   the scene, 2 entered" on every void of K/L/M)
+    CHECK(!ab_voided(24000, 24000, 2, 30));    // (two of 30: still streaming, not a scene change)
+    CHECK(!ab_voided(1000, 1900, 0, 30));      // (1.9x the binds: under the line)
+    CHECK(ab_voided(1000, 2500, 0, 30));       // (2.5x the binds: a menu or a LOD switch moved the workload)
+    CHECK(ab_voided(1000, 300, 0, 30));        // (honestly 3x down: the workload moved, void even with the same scene)
+    CHECK(ab_voided(24000, 24000, 20, 30));    // (most of the anchors moved: a scene change voids at any volume)
+    CHECK(!ab_voided(1000, 1000, 2, 30));      // (2 of 30: 6.7%, under the quarter)
+    CHECK(ab_voided(1000, 1000, 2, 3));        // (2 of 3: most of a small set - the >= 2 minimum does not save it)
+    CHECK(!ab_voided(1000, 1000, 1, 3));       // (1 of a small set: the minimum keeps a lone straddler from voiding)
+    // (and the recycled pool does not void: its range hits an anchor, so it is not counted as a change at all -
+    // anchor_hit above; the measured case: 0x109a's range back as 0x7fd3, binds 23814 -> 24009, was voided by id)
 
     // ---- a skip-list line: one hex start, one a line, '#' a note; a '-' start or trailing junk is refused ----
     uint64_t lo = 0;

@@ -112,27 +112,44 @@ inline bool mirror_worth(double direct_ms, double mirror_ms, double gain_pct, do
     return saved > direct_ms * gain_pct / 100.0 && saved > floor_ms;
 }
 
-// A trial candidate, by its window: enough guest-memory reads to be worth measuring (a pool the GPU barely reads
-// would only ever measure noise, and its verdict would follow the pool for good in the skip list), and not
-// write-dominated (its writes went through guest memory too: a pool the GPU renders into lives best where it is,
-// its writes land in the pool the CPU reads, and out of the mirrors such pools cost only GPU write time -
-// Triforce measured ~1 ms a frame and no gain, while a mirror would buy the write-back's diff back). One
-// megabyte a window, of the several hundred MB a heavy pool gathers: above the noise, under everything real.
-// The caller has already filtered retired pools and pools tried before.
+// A trial candidate, by its window: reads that could possibly pay for the verdict's floor, and not write-dominated.
+// The physics sets the floor: a mirror must save RX_VK_DGPU_FLOOR (0.25 ms) a frame across the window's ~120 frames
+// - some 30 ms - and pool reads run over PCIe at the measured couple of GB/s only for pools reading hundreds of MB
+// a window; below that no verdict is reachable and the trial is churn by construction (measured: a 48 MB pool
+// reading 2 MB a window began three times a run and could never win). 256 MB is that budget with margin. The caller
+// has already filtered retired pools and pools tried before.
 inline bool trial_candidate(uint64_t read_bytes, uint64_t wrote_bytes) {
-    return read_bytes >= (1ull << 20) && wrote_bytes < read_bytes;
+    return read_bytes >= (256ull << 20) && wrote_bytes < read_bytes;
+}
+
+// An anchor of the trial's scene: the guest range a pool covered when the mirror phase began. Anchored by range,
+// not by pool id: the allocator recycles guest memory, and the same range re-imported under a new id (measured:
+// 0x109a rebinding as 0x7fd3 at sizes 80/160/64 MB with its binds stable) is the scene's same pool - by id every
+// recycle would read as the scene moving.
+struct Anchor {
+    uint64_t lo, hi;
+};
+
+// does a pool's range hit one of the scene's anchors? any overlap counts: the recycled pool's size moves (measured
+// 80/160/64 MB), and a scene change's new pools land at other ranges
+inline bool anchor_hit(uint64_t lo, uint64_t hi, const Anchor* anchors, size_t n) {
+    for (size_t i = 0; i < n; i++)
+        if (lo < anchors[i].hi && anchors[i].lo < hi) return true;
+    return false;
 }
 
 // The A/B's validity, checked at the verdict: the two windows must have measured the same scene and the same
-// workload on it. The scene moved when the set of pools the windows bound is not the same (a working mirror
-// changes where a pool's reads are served from, not which pools bind - the caller counts binds on every serving
-// path, the mirror's included, so its service cannot read as drift); the workload moved when the trial pool's own
-// bind count moved over two times either way (a menu, a LOD switch, a load). Either one voids the A/B: no verdict,
-// no skip line, and the caller counts such endings against a cap. What must never void it: the mirror serving the
-// pool's reads, which collapses the guest-memory-served binds (~70x measured) while the scene and the workload
-// stand still - that is the mirror working, and the caller's per-path counting keeps it out of these numbers.
-inline bool ab_voided(uint64_t base_binds, uint64_t binds, size_t scene_moved) {
-    return scene_moved > 0 || binds > 2 * base_binds || 2 * binds < base_binds;
+// workload on it. The scene moved only when a SUBSTANTIAL fraction of the anchored set changed - a real scene
+// change moves most of the set, while Hyrule Field's streaming moves 1-2 anchors a window (measured), guests
+// crossing whatever floor anchors them - and 2 at least, so a small anchor set's single straddler does not void.
+// The workload moved when the trial pool's own bind count moved over two times either way (a menu, a LOD switch).
+// Either one voids the A/B: no verdict, no skip line, and the caller counts such endings against a cap. What must
+// never void it: the mirror serving the pool's reads, which collapses the guest-memory-served binds (~70x measured)
+// while the scene and the workload stand still - that is the mirror working, and the caller's per-path counting
+// keeps it out of these numbers.
+inline bool ab_voided(uint64_t base_binds, uint64_t binds, size_t anchors_changed, size_t anchors_total) {
+    const bool scene_moved = anchors_changed >= 2 && anchors_changed * 4 > anchors_total;
+    return scene_moved || binds > 2 * base_binds || 2 * binds < base_binds;
 }
 
 // A skip-list line: one hex pool start, one a line, as Triforce's keep list keeps them; anything from '#' on is a
