@@ -4097,6 +4097,13 @@ bool memory_writeback_event(uint64_t guest, uint64_t size, uint64_t value, VkEve
             }
     }
     if (!found) return false;
+    // (pass-3 rung 3, RX_RB_STALE — CONSIDERED AND REFUTED, kept out by this comment: serving a stale
+    // snapshot for the tiny slow-adapting sums before this submission's delivery lands would let the
+    // game read its own RESET (it writes 0 right after every read), and the late delivery then stomps
+    // that reset — the read -> reset -> rb_refresh accumulation chain breaks and the meter's sum
+    // diverges. The console gets away with it because its counter lives GPU-side and the CPU's view
+    // is a DMA'd snapshot; here the meter lives in the guest memory the delivery writes. The event
+    // wait RB_EVENTS already reduced (10.54 -> 1.76 ms per waited read) is the sound part of this rung)
     static const int64_t poll_ms = env_int("RX_WB_RB_EVENT_POLL_MS", 30);
     const auto t0 = std::chrono::steady_clock::now();
     for (;;) {
