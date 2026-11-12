@@ -118,6 +118,68 @@ int64_t st_reason[FR_COUNT];
 int flush_reason = FR_OTHER;
 std::chrono::steady_clock::time_point pend_since;
 
+// ---- (hookshot) RX_ASYNC_RENDER=1: asynchronous render mode ----
+// hardware: the GPU takes a submission when it is made and runs it behind the ones before it (nvdrv.c:9, "GPFIFO
+// submissions run on the GPU as they are made"); cross-queue ordering is the GPU's own release ring (max(old,
+// payload), Lichii NX2_NOTES rows 59-62: the CPU ran ~96 command buffers ahead when a 250 ms present wait timed
+// out), and a queue's sync wait is an ordered no-op for the CPU (docs/design.md, nvnQueueWaitSync).
+// ours: everything below is OFF unless RX_ASYNC_RENDER=1 (unset: byte-identical, every branch taken as before) --
+//   * RX_ASYNC_FIF (default 4, clamped 3..kFramesMax): the present path's frame slots instead of 3, so the fence
+//     a present waits for belonged to a slot from RX_ASYNC_FIF frames ago (a deeper GPFIFO-style queue);
+//   * every wait this path can block on is timed on the thread that makes it and reported once a frame
+//     ("vk: async f= ... key=value", a 60-frame "vk: async summary" beside it - the format results/glm's
+//     async-analyze.py reads), so the steady-state maxima are read off the log, not assumed;
+//   * the lag is reported in command buffers (recordings the CPU submitted vs the rec_timeline the GPU reached)
+//     and in presents (handed out vs the timeline value the GPU reached) -- both POLLED, never waited on.
+// Unchanged by this switch: the timeline semaphores' GPU-side ordering and the cross-queue event waits
+// (RX_VK_EVENT_WAITS), the submit-time captures the replay reads (the game's post-submit writes still reach that
+// submission as recorded), and RX_VK_ASYNC / RX_VK_RECORDER, which are independent knobs.
+bool async_render_on() { static const bool v = env_on("RX_ASYNC_RENDER"); return v; }
+// (a present's slots: RX_ASYNC_FIF, default 4 as hardware keeps dozens of buffers queued; 3 = stock)
+constexpr int kFramesMax = 8;
+int async_fif() {
+    static const int n = getenv("RX_ASYNC_FIF") ? std::clamp(atoi(getenv("RX_ASYNC_FIF")), 3, kFramesMax) : 4;
+    return n;
+}
+/// (async) one kind of wait, timed while the switch is on: the maximum and the count since the last report
+struct AsyncWait {
+    std::atomic<uint64_t> max{0}, sum{0}, n{0};
+    void note(uint64_t ns) {
+        sum.fetch_add(ns, std::memory_order_relaxed);
+        n.fetch_add(1, std::memory_order_relaxed);
+        uint64_t m = max.load(std::memory_order_relaxed);
+        while (ns > m && !max.compare_exchange_weak(m, ns, std::memory_order_relaxed)) {}
+    }
+    uint64_t take_max() { return max.exchange(0, std::memory_order_relaxed); }
+    uint64_t take_n() { return n.exchange(0, std::memory_order_relaxed); }
+};
+// (the recording slot wait (begin_recording's PROF_SLOTWAIT) is read as the phase's delta in async_render_log:
+// already timed by the profile, and its scopes live in recording_wait's callers, which tests compile standalone)
+AsyncWait aw_present_fence;    // (present_image's wait for its frame slot's fence)
+AsyncWait aw_acquire;          // (present_image's vkAcquireNextImageKHR: the display engine's, the pacing)
+AsyncWait aw_present_call;     // (the present call itself, e.g. vkQueuePresentKHR blocking in the driver)
+AsyncWait aw_fence;            // (wait(), the game's own fence wait)
+AsyncWait aw_finish;           // (finish(), nvnQueueFinish's catch-up + wait_value)
+AsyncWait aw_readback;         // (invalidate() as a whole: catches up, waits the write-back, flushes texels)
+AsyncWait aw_rb_wait;          // (only the part of it that waits the GPU: wait_recorded / readback_wait_value)
+/// (async) times one code region for the frame's report: constructed before the waits, reported when it goes out of scope
+struct AsyncTimer {
+    bool on;
+    AsyncWait& w;
+    uint64_t t0;
+    explicit AsyncTimer(AsyncWait& kind) : on(async_render_on()), w(kind), t0(on ? prof_now() : 0) {}
+    ~AsyncTimer() {
+        if (on) w.note(prof_now() - t0);
+    }
+    AsyncTimer(const AsyncTimer&) = delete;
+    AsyncTimer& operator=(const AsyncTimer&) = delete;
+};
+// (async) presents in order and the timeline value each signalled: the CPU/GPU present lag, polled (ring of 64)
+constexpr int kAsyncPresents = 64;
+struct { uint64_t seq = 0, value = 0; } async_presents[kAsyncPresents];
+uint64_t async_cpu_presents = 0;   // (the presents the CPU handed out)
+uint64_t async_gpu_presents = 0;   // (the presents whose value the GPU has reached)
+
 struct Recording {
     VkCommandPool pool = VK_NULL_HANDLE;
     VkCommandPool upload_pool = VK_NULL_HANDLE;   // (its own: a parallel replay's threads record uploads into it while the
@@ -2188,7 +2250,8 @@ uint64_t fence_q(uint64_t queue) {
     return it != q_last.end() ? it->second : fence();
 }
 int wait(uint64_t f, uint64_t timeout_ns) {
-    if (completed() >= f) return 1;
+    if (completed() >= f) return 1;   // (a poll: hardware answers a passed syncpoint without blocking the CPU)
+    AsyncTimer async(aw_fence);        // (RX_ASYNC_RENDER: what the game's fence wait really cost)
     FpsRender fr;   // (the FPS counter's Breakdown: the replay of stopped work in here is the renderer's, the waits the GPU's)
     queue_flush_for(FR_WAIT);
     // (hookshot) a fence of one queue whose work up to it is recorded whole (none of it stopped): that work, not the other
@@ -2250,6 +2313,7 @@ int wait(uint64_t f, uint64_t timeout_ns) {
 void wait_queue_empty();
 bool replay_behind();
 void finish() {
+    AsyncTimer async(aw_finish);       // (RX_ASYNC_RENDER: nvnQueueFinish's catch-up + wait, timed)
     FpsWait fw(fps_stats::kGpuWait);   // (the FPS counter's Breakdown)
     wait_queue_empty();
     wait_value(pushed.load());
@@ -2322,6 +2386,7 @@ bool readback_wait_value(uint64_t v) {
     return false;
 }
 void invalidate(uint64_t gpu, uint64_t size) {
+    AsyncTimer async(aw_readback);   // (RX_ASYNC_RENDER: a CPU read of GPU results, timed: catch-up, write-back wait, flush)
     static const bool log_inv = env_on("RX_VK_LOG_INVALIDATE");
     static std::atomic<int> logged{0};
     if (log_inv && logged++ < 400) {
@@ -2380,6 +2445,8 @@ void invalidate(uint64_t gpu, uint64_t size) {
             const auto w1 = std::chrono::steady_clock::now();
             const uint64_t v = memory_writeback_value(host->gpu_guest(gpu), size, nullptr);
             if (v > completed()) {
+                AsyncTimer rbwait(aw_rb_wait);   // (RX_ASYNC_RENDER: the GPU's write-back, waited here only - the rest of
+                                                 //  invalidate() above and below is the catch-up's and the memcpy's CPU work)
                 int ok = 0;
                 if (!(unforced && wait_recorded(v, UINT64_MAX, &ok))) {
                     if (unforced && replay_behind()) wait_queue_empty();   // (not recorded whole: as before)
@@ -2458,7 +2525,11 @@ struct Frame {
     VkFence done = VK_NULL_HANDLE;
     VkSemaphore acquired = VK_NULL_HANDLE;
 };
-Frame frames[3];
+// (3 slots: the fence a present waits for is the copy of 3 presents ago. RX_ASYNC_RENDER=1 deepens the ring to
+// RX_ASYNC_FIF, so the CPU waits on a fence older than the GPU can take to run the frames it is ahead of --
+// the console's model, where the GPU holds many command buffers queued (nvdrv.c:9; Lichii NX2_NOTES row 59))
+Frame frames[kFramesMax];
+int frames_n = 3;   // (the slots made and used; 3 = stock)
 uint32_t frame_index = 0;
 int64_t presents = 0;
 
@@ -3185,6 +3256,9 @@ std::shared_ptr<std::vector<uint8_t>> shot_pixels(uint64_t at_value, int64_t at_
     const uint8_t* const sm = (const uint8_t*)shot_maps[at_present & 1];
     return std::make_shared<std::vector<uint8_t>>(sm, sm + (size_t)kShotW * kShotH * 4);
 }
+void async_render_log();   // (RX_ASYNC_RENDER: defined after do_present, out of the region the tests cut out of this
+                           //  source - tests/test_capture_readback_visibility reads everything between here and there)
+
 void do_present(const nvn_tex* t, const int crop[4]) {
     static PendingShot pending;
     // (hookshot) NVIDIA Reflex (vk_reflex.cpp): this frame's simulation ended, its submission starts; on the way out (after the
@@ -3347,6 +3421,10 @@ void do_present(const nvn_tex* t, const int crop[4]) {
         full_barrier(r.cmd);
         submit_recording(r);   // (nothing is stopped at a present: drain)
         if (pushed.load() < value) pushed = value;
+        if (async_render_on()) {   // (RX_ASYNC_RENDER: this present's timeline value, read later for the lag)
+            async_presents[(uint64_t)presents % kAsyncPresents] = {(uint64_t)presents, value};
+            async_cpu_presents = (uint64_t)presents;
+        }
         done_max = std::max(done_max, value), signaled = std::max(signaled, value);
         shot_ask_take();   // (an earlier present's, when the GPU is past it)
         if (fg_after) {
@@ -3574,8 +3652,84 @@ void do_present(const nvn_tex* t, const int crop[4]) {
         log_frame_stats();
     }
     if (dev.offscreen) frame_log_present();   // (no window: the copy into the offscreen image above is its present)
+    async_render_log();   // (RX_ASYNC_RENDER=1: this frame's keys. present_image runs after the line, so its own
+                          //  fence and present-call waits land in the NEXT line - each key's worst value over the
+                          //  run is what the proof reads, and they are never dropped)
     if (dev.offscreen || interpolated) return;
     present_image(src, sw, sh, crop, direct_view);
+}
+
+/// (RX_ASYNC_RENDER=1) once a frame: the waits this frame blocked on (ms, worst of each kind) and how far the
+/// CPU is ahead of the GPU -- command buffers (recordings) and presents alike. Every value here is READ, never
+/// waited for: the GPU's two timelines are polled with vkGetSemaphoreCounterValue, which does not block.
+/// hardware: the CPU is never asked to wait for completion (nvdrv.c:9), so a healthy line shows this frame's
+/// waits=0 with cb lag > 0; ours reports exactly that, per frame, for the proof to read off the log.
+void async_render_log() {
+    if (!async_render_on()) return;
+    static int64_t wall0 = 0, gpu0 = 0, slot0 = 0;
+    static double all_fence_max = 0;
+    static long all_over2 = 0, all_n = 0;                 // (all-time: the present fence's worst wait, and > 2 ms frames)
+    static double win_fmax = 0, win_fsum = 0, win_amax = 0, win_wsum = 0, win_gsum = 0;
+    static long win_n = 0;
+    static long since_report = 0;
+    static int64_t win_start = 0;                         // (t of the window's first frame, ns)
+    const uint64_t done = completed();   // (the timeline's current value: a counter read, no wait)
+    while (async_gpu_presents < async_cpu_presents) {   // (the presents whose value the GPU has reached, in order)
+        const auto& e = async_presents[(async_gpu_presents + 1) % kAsyncPresents];
+        if (e.seq != async_gpu_presents + 1 || e.value > done) break;
+        async_gpu_presents++;
+    }
+    uint64_t rec_gpu = 0;
+    if (rec_timeline) vkGetSemaphoreCounterValue(dev.device, rec_timeline, &rec_gpu);   // (recordings: CPU count vs GPU reach)
+    const int64_t wall = prof_now(), gpu_ns = st_gpu_ns;
+    const double frame_ms = wall0 ? (double)(wall - wall0) / 1e6 : 0.0, gpu_ms = gpu0 ? (double)(gpu_ns - gpu0) / 1e6 : 0.0;
+    wall0 = wall, gpu0 = gpu_ns;
+    const int64_t slot_now = prof_ns[PROF_SLOTWAIT];   // (the recording slot wait: this phase's own timer)
+    const double slot_ms = slot0 ? (double)(slot_now - slot0) / 1e6 : 0.0;
+    slot0 = slot_now;
+    // (the waits below are the ones made since the line before: present_image runs after this line, so the fence and
+    //  the acquire there belong to the previous line - their worst value over the run is what is read off a log)
+    const double fw = aw_present_fence.take_max() / 1e6, aw = aw_acquire.take_max() / 1e6;
+    const double pc = aw_present_call.take_max() / 1e6, fnc = aw_fence.take_max() / 1e6;
+    const double fin = aw_finish.take_max() / 1e6, rb = aw_readback.take_max() / 1e6;
+    const int busy = (int)(gpu_ms * 100.0 / (frame_ms > 0 ? frame_ms : 1e-9));
+    const long cb_lag = (long)rec_seq - (long)rec_gpu;
+    const long p_lag = (long)async_cpu_presents - (long)async_gpu_presents;
+    const uint64_t waited = aw_present_fence.take_n() + aw_acquire.take_n() + aw_present_call.take_n() + aw_fence.take_n() +
+                            aw_finish.take_n() + aw_readback.take_n() + (slot_ms > 0.0 ? 1 : 0);
+    ++all_n;
+    if (fw > all_fence_max) all_fence_max = fw;
+    if (fw > 2.0) ++all_over2;
+    if (fw > win_fmax) win_fmax = fw;
+    if (aw > win_amax) win_amax = aw;
+    win_fsum += fw;
+    win_wsum += frame_ms;
+    win_gsum += gpu_ms;
+    ++win_n;
+    if (!win_start) win_start = wall;   // (this window's first frame)
+    if (++since_report >= 60) {         // (the shared summary format, results/glm/async-analyze.py)
+        const double wsec = (wall - win_start) / 1e9;
+        logf("vk: async summary: %ld frames in %.3f s = %.2f fps | fifo_max=%ld lagv=%ld (cpu %llu gpu %llu) | "
+             "window fence max=%.3f avg=%.3f ms | all-time fence max=%.3f over2ms=%ld/%ld | acq max=%.3f | "
+             "window cpu_ms=%.1f gpu_ms=%.1f busy=%d%%",
+             since_report, wsec, wsec > 0 ? since_report / wsec : 0.0, p_lag, cb_lag, (unsigned long long)rec_seq,
+             (unsigned long long)rec_gpu, win_fmax, win_n ? win_fsum / win_n : 0.0, all_fence_max, all_over2, all_n,
+             win_amax, win_wsum, win_gsum, win_wsum > 0 ? (int)(win_gsum * 100.0 / win_wsum) : 0);
+        since_report = 0;
+        win_fmax = win_fsum = win_amax = win_wsum = win_gsum = 0;
+        win_n = 0;
+        win_start = 0;
+    }
+    const int64_t pres_now = prof_ns[PROF_PRESENT], sub_now = prof_ns[PROF_SUBMIT];   // (the frame's replay phases:
+    static int64_t pres0 = 0, sub0 = 0;   //  real CPU work, kept beside the waits so a stall inside them shows as a spike)
+    const double pms = pres0 ? (double)(pres_now - pres0) / 1e6 : 0.0, sms = sub0 ? (double)(sub_now - sub0) / 1e6 : 0.0;
+    pres0 = pres_now, sub0 = sub_now;
+    logf("vk: async f=%lld t=%.3f fifo=%ld lagv=%ld fw=%.3f aw=%.3f slotw=%.3f busy=%d%% dt=%.3f | "
+         "detail cb cpu=%llu gpu=%llu p cpu=%llu gpu=%llu waits=%llu fence_ms=%.3f finish_ms=%.3f readback_ms=%.3f "
+         "present_call_ms=%.3f gpu_ms=%.3f | prof present_ms=%.3f submit_ms=%.3f readback_wait_ms=%.3f",
+         (long long)presents, wall / 1e9, p_lag, cb_lag, fw, aw, slot_ms, busy, frame_ms, (unsigned long long)rec_seq,
+         (unsigned long long)rec_gpu, (unsigned long long)async_cpu_presents, (unsigned long long)async_gpu_presents,
+         (unsigned long long)waited, fnc, fin, rb, pc, gpu_ms, pms, sms, aw_rb_wait.take_max() / 1e6);
 }
 
 } // namespace
@@ -3603,7 +3757,7 @@ struct LogSlot {
     int64_t at = 0;
     uint32_t seq = 0, kind = 0;
 };
-LogSlot log_slots[3];
+LogSlot log_slots[kFramesMax];   // (one per present frame slot; the framelog uses them round-robin)
 VkImage log_image = VK_NULL_HANDLE;
 VmaAllocation log_image_alloc = nullptr;
 std::mutex log_mu;
@@ -3827,9 +3981,12 @@ void present_image(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkI
     menu_tick();
     Frame& f = frames[frame_index];
     const int log_slot = frame_index;
-    frame_index = (frame_index + 1) % 3;
+    frame_index = (frame_index + 1) % frames_n;
     const int64_t fence_t0 = fps_breakdown_on() ? fps_clock() : 0;   // (the FPS counter's Breakdown: this frame slot's last copy)
-    if (vkWaitForFences(dev.device, 1, &f.done, VK_TRUE, UINT64_MAX) == VK_ERROR_DEVICE_LOST) device_lost();
+    // (RX_ASYNC_RENDER: this slot's fence is frames_n presents (RX_ASYNC_FIF) old, so by the time it is waited for the
+    // GPU has had several frames to finish it; the wait is timed for the frame's report. Kept on one line: the tests
+    // cut this call out by its line - test_present_device_loss's site scan and test_capture_readback_visibility's region)
+    const bool async_fence = async_render_on(); const uint64_t async_t0 = async_fence ? (uint64_t)prof_now() : 0; if (vkWaitForFences(dev.device, 1, &f.done, VK_TRUE, UINT64_MAX) == VK_ERROR_DEVICE_LOST) device_lost(); if (async_fence) aw_present_fence.note(prof_now() - async_t0);
     framelog_collect(log_slot);
     uint32_t index = 0;
     const int64_t acquire_t0 = fence_t0 ? fps_clock() : 0;   // (then the swapchain's image: the display's pace)
@@ -3844,7 +4001,9 @@ void present_image(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkI
     static bool unseen = false;
     const uint64_t acquire_timeout = unseen ? 0 : 100000000ull;
 #endif
-    VkResult res = vkAcquireNextImageKHR(dev.device, dev.swapchain, acquire_timeout, f.acquired, VK_NULL_HANDLE, &index);
+    // (RX_ASYNC_RENDER: the acquire's wait for a free image - the display engine's, so the assembly; measured like the fence,
+    // on this line: tests cut this call out by it, the device-loss scan's site being this line and the one after it)
+    const bool async_acq = async_render_on(); const uint64_t acq_t0 = async_acq ? (uint64_t)prof_now() : 0; VkResult res = vkAcquireNextImageKHR(dev.device, dev.swapchain, acquire_timeout, f.acquired, VK_NULL_HANDLE, &index); if (async_acq) aw_acquire.note(prof_now() - acq_t0);
     if (res == VK_ERROR_DEVICE_LOST) device_lost();
     if (acquire_t0) fps_wait(fps_stats::kPace, fps_clock() - acquire_t0);
     if (res == VK_ERROR_SURFACE_LOST_KHR) {
@@ -4013,9 +4172,13 @@ void present_image(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkI
         present_defer_into->swapchain_generation = dev.swapchain_generation;
         return;
     }
+    const bool async_call = async_render_on();   // (RX_ASYNC_RENDER: the present call's cost, timed: vkQueuePresentKHR
+    const uint64_t call_t0 = async_call ? (uint64_t)prof_now() : 0;   //  blocks in the driver where hardware's vi2
+                                                                      //  present is ordered no-op, paced by the vblank)
     present_copy_done = f.done;
     present_out(index, qk);
     present_copy_done = VK_NULL_HANDLE;
+    if (async_call) aw_present_call.note(prof_now() - call_t0);   // (the three lines above are one test's needle)
 }
 
 bool present_commit(const PendingPresent& p) {
@@ -4757,7 +4920,9 @@ bool replay_start() {
         vkAllocateCommandBuffers(dev.device, &ai, &r.upload);
     }
     ai.commandBufferCount = 1;
-    for (Frame& f : frames) {
+    frames_n = async_render_on() ? async_fif() : 3;   // (the present ring's depth: RX_ASYNC_FIF while the switch is on)
+    for (int slot = 0; slot < frames_n; slot++) {
+        Frame& f = frames[slot];
         if (vkCreateCommandPool(dev.device, &pi, nullptr, &f.pool) != VK_SUCCESS) return false;
         ai.commandPool = f.pool;
         vkAllocateCommandBuffers(dev.device, &ai, &f.cmd);

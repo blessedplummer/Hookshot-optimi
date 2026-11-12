@@ -23,6 +23,10 @@ bool coherent = false;
 bool implicit_host = false;
 int waits = 0, invalidations = 0, pngs = 0;
 [[noreturn]] void device_lost() { std::abort(); }
+// (gpu/vk/vk_replay.cpp's RX_ASYNC_RENDER wait reporting, whose line is cut out of present_image below: measured off)
+bool async_render_on() { return false; }
+int64_t prof_now() { return 0; }
+struct { void note(uint64_t) {} } aw_present_fence;
 void require(bool ok, const char* why) {
     if (!ok) { std::fprintf(stderr, "%s\n", why); std::exit(1); }
 }

@@ -57,6 +57,10 @@ uint64_t acquire_timeout=UINT64_MAX;
 int result=VK_SUCCESS, calls=0, reports=0, continued=0;
 struct Lost {};
 [[noreturn]] void device_lost() { ++reports; throw Lost{}; }
+// (gpu/vk/vk_replay.cpp's RX_ASYNC_RENDER wait reporting, whose line can be one of the sites below: measured off)
+bool async_render_on() { return false; }
+int64_t prof_now() { return 0; }
+struct { void note(uint64_t) {} } aw_present_fence, aw_acquire;
 '''
     for call in CALLS:
         fixture += "template<class... A> VkResult " + call + "(A...) { ++calls; return result; }\n"
