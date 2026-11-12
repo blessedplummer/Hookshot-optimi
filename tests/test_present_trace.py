@@ -55,6 +55,9 @@ static const nvn_tex *win_tex(const nvn_win *o, int i) { (void)o; (void)i; retur
 static void rx_nvn_present(const nvn_tex *t, const int crop[4]) {
     (void)t; (void)crop; clock_now += renderer_work;
 }
+/* (host/nvn_native.c's RX_ASYNC_RENDER release anchors, called from nvnQueuePresentTexture: no-ops without the flag) */
+static void rx_present_note(void) {}
+static void rx_present_commit(void) {}
 static void hos_vcore_back(void) { clock_now += back_work; }
 #define G32(a) guest32
 #define G64(a) ((uint64_t)0)

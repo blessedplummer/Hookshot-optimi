@@ -303,6 +303,9 @@ static void not_in_use(const void* cb, const char* op) {
 #define F(name, params, ...) \
     static void VKAPI_CALL fake_##name params { QUIET Guard g_(cb, #name, true); begin(#name); track(cb, #name); __VA_ARGS__ }
 
+F(vkCmdSetEvent2, (VkCommandBuffer cb, VkEvent ev, const VkDependencyInfo* d), handle(cb), handle(ev); put(d->sType), put((uint8_t)!!d->pNext);
+  A(d->pMemoryBarriers, d->memoryBarrierCount), A(d->pBufferMemoryBarriers, d->bufferMemoryBarrierCount);
+  A(d->pImageMemoryBarriers, d->imageMemoryBarrierCount);)
 F(vkCmdPipelineBarrier2, (VkCommandBuffer cb, const VkDependencyInfo* d), handle(cb); put(d->sType), put((uint8_t)!!d->pNext), put(d->dependencyFlags);
   A(d->pMemoryBarriers, d->memoryBarrierCount), A(d->pBufferMemoryBarriers, d->bufferMemoryBarrierCount);
   A(d->pImageMemoryBarriers, d->imageMemoryBarrierCount);)
@@ -721,6 +724,15 @@ static void frame() {
     }
     vkCmdFillBuffer(cmd, H<VkBuffer>(0xE200), 0, VK_WHOLE_SIZE, 0);
     barrier(cmd, 0);
+    {   // (vk_memory.cpp's early delivery, RX_WB_RB_EVENTS: the copy's writes made host-visible, then the event set)
+        VkMemoryBarrier2 mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+        mb.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT, mb.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        mb.dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT, mb.dstAccessMask = VK_ACCESS_2_HOST_READ_BIT;
+        VkDependencyInfo di{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+        di.memoryBarrierCount = 1, di.pMemoryBarriers = &mb;
+        vkCmdSetEvent2(cmd, H<VkEvent>(0xE800), &di);
+        if (g_mutate) poison(&mb), poison(&di);
+    }
     for (int pass = 0; pass < 2; pass++) {
         begin_pass(cmd, pass);
         for (int d = 0; d < 3; d++) {   // (draw(): pipeline, descriptors, push constants, dynamic state, streams, the draw)

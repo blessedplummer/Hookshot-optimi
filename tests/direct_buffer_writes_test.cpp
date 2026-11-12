@@ -41,6 +41,7 @@ static void require(bool condition, const char* message) {
 struct ParLock { ParLock() {} ~ParLock() {} };
 static void texture_gpu_wrote(uint64_t, uint64_t) { ++texture_writes; }
 static void rb_hazard_locked(uint64_t lo, uint64_t hi) { ++hazards; hazard_lo = lo; hazard_hi = hi; }
+static void rb_deliver_note(Pool*, uint64_t, uint64_t, uint64_t) {}   // (RX_WB_RB_EVENTS's early delivery: not under test here)
 static bool mirror_on() { return mirrors; }
 static Pool* pool_of(uint64_t guest, uint64_t size) {
     ++lookups;

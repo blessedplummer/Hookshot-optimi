@@ -78,6 +78,8 @@ uint64_t mirror_epoch = 0;
 bool mirror_upload = false;
 #include "rb_writeback.inc"
 std::vector<WriteBack> writebacks;
+uint64_t mem_rec_value = 0;                                    // (the recording's write-back value: the bind tail reads it)
+void rb_deliver_note(Pool*, uint64_t, uint64_t, uint64_t) {}   // (RX_WB_RB_EVENTS's early delivery: not under test here)
 void mirror_sync(Pool& p) {   // (model: no CPU page is dirty here)
     p.synced_epoch = mirror_epoch;
     p.sync_seg = texture_segment();

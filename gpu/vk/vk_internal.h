@@ -167,6 +167,14 @@ bool probe_serial();
 void probe_dump_all(const char* why);
 void probe_log(uint64_t frame);
 void memory_end_submission(VkCommandBuffer cmd);
+/// (hookshot, wb-minimize) RX_WB_RB_EVENTS=1: written binds whose range touches the readback history (the meters and
+/// counters the game reads every frame) are delivered into guest memory (their write-back copy, made early) right after
+/// the pass that binds them, each with its own event signaled then; the CPU's readback polls the event before it waits
+/// for the write-back value's submission. memory_rb_deliver records the deliveries (outside any render pass, after one);
+/// memory_writeback_event finds the covering one at a readback
+void memory_rb_deliver(VkCommandBuffer cmd);
+bool memory_writeback_event(uint64_t guest, uint64_t size, uint64_t value, VkEvent* ev);
+bool memory_rb_events_on();
 /// The game made a memory pool (gpu address, bytes): imported in the background, before it is used
 /// RX_VK_CHECKPOINTS: the draws the GPU reached, logged once the device is lost (vk_draw.cpp)
 void checkpoints_report();
@@ -228,6 +236,7 @@ bool memory_has_shadow(uint64_t guest, uint64_t n);
 /// A read of guest memory by the replay as the submission being recorded had it: the pages a kept capture holds from
 /// there (the game writes several submits ahead of the replay), the rest from guest memory. False when unreadable
 bool memory_read_as_submitted(uint64_t gpu, void* dst, uint64_t n);
+bool memory_cpu_words_own(uint64_t guest, uint64_t size);   // (RX_VK_COND_CPU_WORDS: the replay's own CPU-written words)
 uint64_t memory_capture_view();          // (bumped when a capture is published or any page is stamped)
 uint32_t memory_page_stamp(uint64_t gpu); // (that address's page only)
 uint64_t gpu_pool_end(uint64_t gpu);   // (hookshot) where the memory pool holding that address ends, 0: in none (vk_memory.cpp)

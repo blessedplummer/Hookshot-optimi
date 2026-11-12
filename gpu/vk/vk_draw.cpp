@@ -4930,6 +4930,7 @@ void end_pass(VkCommandBuffer cmd) {
     vkCmdEndRendering(cmd);
     pass().open = false;
     note_pass_end(cmd);   // (before the dumps and probes below: they record work, and the next pass's barrier is then a full one)
+    memory_rb_deliver(cmd);   // (wb-minimize: what this pass's written binds owed the readback, delivered now, outside the pass)
     if (pass().has_block_images) {
         full_barrier(cmd, "barrier (before BC slice stores)");
         for (int i = 0; i < pass().n; i++)
@@ -8886,6 +8887,7 @@ void dispatch(VkCommandBuffer cmd, NvnState& s, uint32_t x, uint32_t y, uint32_t
             snprintf(what, sizeof what, "dispatch %ux%ux%u prog %016llx img%zu", x, y, z, (unsigned long long)p.key, i);
             dump_image(cmd, dump_written()[i].tex, dump_written()[i].level, 0, what);
         }
+    memory_rb_deliver(cmd);   // (wb-minimize: what the binds of this dispatch owed the readback, delivered right here)
 }
 
 // (hookshot) In the parallel replay's dry pass, in stream order on the replay thread: the images this draw or dispatch

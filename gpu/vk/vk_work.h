@@ -19,6 +19,7 @@ inline void note_work() {
 } // namespace mkwvk
 
 #define vkCmdPipelineBarrier2(...) (::mkwvk::note_work(), ::mkwvk::rec::rx_vkCmdPipelineBarrier2(__VA_ARGS__))
+#define vkCmdSetEvent2(...) (::mkwvk::note_work(), ::mkwvk::rec::rx_vkCmdSetEvent2(__VA_ARGS__))
 #define vkCmdBeginRendering(...) (::mkwvk::note_work(), ::mkwvk::rec::rx_vkCmdBeginRendering(__VA_ARGS__))
 #define vkCmdEndRendering(...) (::mkwvk::note_work(), ::mkwvk::rec::rx_vkCmdEndRendering(__VA_ARGS__))
 #define vkCmdDraw(...) (::mkwvk::note_work(), ::mkwvk::rec::rx_vkCmdDraw(__VA_ARGS__))
@@ -103,6 +104,7 @@ inline void note_work() {
 #define vkDeviceWaitIdle(...) (::mkwvk::rec::boundary(::mkwvk::rec::B_vkDeviceWaitIdle), ::vkx::vkDeviceWaitIdle(__VA_ARGS__))
 #define vkWaitForFences(...) (::mkwvk::rec::boundary(::mkwvk::rec::B_vkWaitForFences), ::vkx::vkWaitForFences(__VA_ARGS__))
 #define vkResetFences(...) (::mkwvk::rec::boundary(::mkwvk::rec::B_vkResetFences), ::vkx::vkResetFences(__VA_ARGS__))
+#define vkResetEvent(...) (::mkwvk::rec::boundary(::mkwvk::rec::B_vkResetEvent), ::vkx::vkResetEvent(__VA_ARGS__))
 #define vkWaitSemaphores(...) (::mkwvk::rec::boundary(::mkwvk::rec::B_vkWaitSemaphores), ::vkx::vkWaitSemaphores(__VA_ARGS__))
 #define vkGetSemaphoreCounterValue(...) (::mkwvk::rec::boundary(::mkwvk::rec::B_vkGetSemaphoreCounterValue), ::vkx::vkGetSemaphoreCounterValue(__VA_ARGS__))
 #define vkGetQueryPoolResults(...) (::mkwvk::rec::boundary(::mkwvk::rec::B_vkGetQueryPoolResults), ::vkx::vkGetQueryPoolResults(__VA_ARGS__))

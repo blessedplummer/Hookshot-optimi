@@ -1137,13 +1137,90 @@ int hos_nvn_event_value(uint64_t guest_event, uint32_t *v) {
     nvn_gpu_read(e->gpu, v, 4);
     return 1;
 }
+/* (hookshot, RX_ASYNC_RENDER) PRESENT-ANCHORED RELEASE (phase 3, ported from async-render-glm's 99846722): the
+   game's frame-release poll (the two present-poll LRs) is answered from the PRESENT's hand-over, not from the GPU's
+   write-back. Hardware: vi2 signals the frame-release events at the display's vblank (NX2_NOTES row 82), so the
+   console's present-to-release is ~0 (design.md:277 measured our synchronous path at 2.7 ms, of which 2.4 inside
+   vkQueuePresentKHR); the async replay's write-back added the GPU's completion behind that. nvnQueuePresentTexture
+   notes when the frame is committed to the present path (rx_present_note at the call's start, rx_present_commit after
+   the renderer has it); the release fires at the first poll after that commit (RX_ASYNC_RELEASE_WAIT_MS, default 0 =
+   the console's timing), once per presented frame.
+   Ordering (the coordinator's caveat): a release now fires before the GPU's write-back, so every read of a
+   GPU-written result must still wait its own value — invalidate() does (memory_writeback_value ->
+   wait_recorded / readback_wait_value on the timeline), fences ride the timeline, and the replay's captures keep the
+   recording off memory the game rewrote after its submit. Only the present polls are let through here; every other
+   event keeps reading the GPU's value. Every release logs its present-to-release latency (per frame; the proof's
+   criterion 5) */
+static volatile LONG64 rx_present_ns;      /* (the last present's commit to the present path: the release's anchor) */
+static volatile LONG64 rx_call_ns;         /* (the present call's start: what the call itself took, for the release line) */
+static volatile LONG64 rx_present_count;   /* (presents so far, same hook) */
+static volatile LONG64 rx_release_present; /* (rx_present_count at the last release) */
+static volatile LONG64 rx_release_due_at;  /* (when the current frame's release may fire: its present + the wait) */
+static volatile LONG64 rx_release_n;
+static volatile LONG64 rx_rel_win_ns, rx_rel_win_max, rx_rel_win_n;   /* (the last 60: the line's window) */
+static int rx_paced(void) {
+    static int on = -1;   /* (one env read: RX_ASYNC_RENDER unset = stock, nothing below runs) */
+    if (on < 0) on = env_on("RX_ASYNC_RENDER");
+    return on;
+}
+/* (nvnQueuePresentTexture, before it calls the renderer): the present call's start — the release line reports what
+   the call itself took (its replay of the frame's commands is ~6-16 ms of it, the same work stock does) */
+static void rx_present_note(void) {
+    if (!rx_paced()) return;
+    rx_call_ns = hos_now_ns();
+}
+/* (nvnQueuePresentTexture, right after the renderer has the frame): the frame is COMMITTED to the present path here
+   — recorded, its copy submitted, handed to the presenter — and this is the release's anchor, so present-to-release
+   measures the commit -> the game's poll, not the frame's own replay work (async-render-glm's 99846722 measured the
+   same span: 0.39-0.62 ms, against design.md:277's stock chain of 2.7 ms from present call to release event) */
+static void rx_present_commit(void) {
+    if (!rx_paced()) return;
+    rx_present_ns = hos_now_ns();
+    InterlockedIncrement64(&rx_present_count);
+}
+int rx_release_due(void) {
+    static int64_t wait_ns = -1;
+    if (wait_ns < 0) {
+        const char *e = getenv("RX_ASYNC_RELEASE_WAIT_MS");
+        wait_ns = e ? (int64_t)(atof(e) * 1e6) : 0;
+    }
+    const int64_t p = rx_present_count, now = hos_now_ns();
+    if (!rx_present_ns) return 1;   /* (no present yet: the boot runs free) */
+    if (p == rx_release_present) return 0;   /* (no frame presented since the last release: nothing to release) */
+    if (rx_release_due_at < rx_present_ns) rx_release_due_at = now + wait_ns;   /* (this frame's first poll: its window) */
+    if (now < rx_release_due_at) return 0;
+    const int64_t lat = now - rx_present_ns;
+    const int64_t call = rx_present_ns - rx_call_ns;
+    rx_release_present = p;
+    const LONG64 n = InterlockedIncrement64(&rx_release_n);
+    const LONG64 win_sum = InterlockedAdd64(&rx_rel_win_ns, lat);
+    const LONG64 win_n = InterlockedIncrement64(&rx_rel_win_n);
+    if (lat > rx_rel_win_max) rx_rel_win_max = lat;
+    /* (criterion 5: present-to-release logged PER FRAME — commit -> the game's poll, with the present call the
+       frame's own replay took before it, against the window of the last 60) */
+    hos_log("rx: release: f=%lld paced from the present: present-to-release %.3f ms (commit to the game's poll; "
+            "the present call before it %.3f ms; window 60 mean %.3f max %.3f, n %lld of %lld releases)",
+            (long long)p, lat / 1e6, call / 1e6, win_sum / (double)win_n / 1e6, rx_rel_win_max / 1e6,
+            (long long)win_n, (long long)n);
+    if (win_n >= 60) {   /* (the window's stats read; the next 60 start) */
+        InterlockedExchange64(&rx_rel_win_ns, 0);
+        InterlockedExchange64(&rx_rel_win_max, 0);
+        InterlockedExchange64(&rx_rel_win_n, 0);
+    }
+    return 1;
+}
+
 NV(nvnEventGetValue) {
-    {   /* (hookshot, experiment) HOS_PRESENT_NOWAIT=1: OoT's present poll (hos_thread.c present_poll) sees its frame's
-           event signalled at once: the replay reads memory as submitted, so the game may go on to the next frame
-           while this one is replayed, as far as the window's textures and the replay's queue let it */
-        static int nowait = -1;
+    {   /* (hookshot, RX_ASYNC_RENDER) the release fires from the present: the two present-poll LRs are answered here
+           while paced (the console's timing, vi2's vblank-cadence release), every other event keeps reading the
+           GPU's value below. HOS_PRESENT_NOWAIT=1 stays as before (the poll let through entirely) */
+        static int nowait = -1, paced = -1;
         if (nowait < 0) nowait = getenv("HOS_PRESENT_NOWAIT") && atoi(getenv("HOS_PRESENT_NOWAIT")) != 0;
-        if (nowait && (c->x[30] == 0x805904a0 || c->x[30] == 0x80590530)) { RET(1); return; }
+        if (paced < 0) paced = env_on("RX_ASYNC_RENDER");
+        if (c->x[30] == 0x805904a0 || c->x[30] == 0x80590530) {
+            if (nowait || (paced && rx_release_due())) { RET(1); return; }
+            if (paced) { RET(0); return; }
+        }
     }
     uint32_t v = 0; nvn_gpu_read(((const nvn_event *)P(0))->gpu, &v, 4); RET(v);
     if (sync_log()) hos_log("nvn: EventGetValue %p = %u (lr %#llx)", P(0), v, (unsigned long long)c->x[30]);
@@ -2502,7 +2579,10 @@ NV(nvnQueuePresentTexture) {
     {
         const int away = hos_vcore_away();
         if (trace) phases[1] = hos_now_ns();
+        rx_present_note();   /* (hookshot, RX_ASYNC_RENDER: the present call's start, for the release line) */
         rx_nvn_present(win_tex(o, i), o->crop);
+        rx_present_commit();   /* (hookshot, RX_ASYNC_RENDER: the frame is committed to the present path here — the
+                                release event's anchor; a no-op unless the switch is on) */
         if (trace) phases[2] = hos_now_ns();
         if (away) hos_vcore_back();
         if (trace) phases[3] = hos_now_ns();

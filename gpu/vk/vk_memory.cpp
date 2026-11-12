@@ -83,6 +83,9 @@ struct Pool {
     VmaAllocation shadow_alloc = nullptr;
     VkDeviceAddress shadow_address = 0;
     std::vector<uint64_t> shadow_known;   // (a bit a page)
+    // (hookshot, RX_VK_RB_EVER_PAGES) guest pages of this pool the CPU ever read back whose 600-epoch TTL expired
+    // (memory_rb_refresh): refreshed while the GPU binds the pool again, never while it idles
+    std::vector<uint32_t> rb_ever;
 };
 uint64_t mem_rec_value = 0, mem_completed = 0;   // (the recording being made, and the GPU's progress)
 
@@ -2232,6 +2235,20 @@ void memory_cpu_owned(uint64_t guest, uint64_t size) {
     for (uint64_t a = guest & ~7ull; a < guest + size; a += 8) cpu_words_new.push_back(a);
     // (the write itself, guest_cpu_write, has told the write-back diff's shadows)
 }
+/// (hookshot, RX_VK_COND_CPU_WORDS) whether every 8-byte word of guest [guest, guest + size) is one the replay itself
+/// wrote on the CPU (memory_cpu_owned's words: NOP_CLEAR_BUF and friends). Caller holds no lock; the three vectors are
+/// cpu_words_mu's. cpu_words/cpu_words_recent are sorted; cpu_words_new is not (small, merged often)
+bool memory_cpu_words_own(uint64_t guest, uint64_t size) {
+    if (!guest || !size) return false;
+    std::lock_guard lk(cpu_words_mu);
+    cpu_words_merge();
+    for (uint64_t a = guest & ~7ull; a < guest + size; a += 8) {
+        if (std::binary_search(cpu_words.begin(), cpu_words.end(), a)) continue;
+        if (std::binary_search(cpu_words_recent.begin(), cpu_words_recent.end(), a)) continue;
+        if (std::find(cpu_words_new.begin(), cpu_words_new.end(), a) == cpu_words_new.end()) return false;
+    }
+    return true;
+}
 namespace {
 // (a write-back's runs with the replay's own words cut out of them: runs of p, offsets in the pool)
 void cut_cpu_words(const Pool& p, std::vector<VkBufferCopy>& runs) {
@@ -2425,6 +2442,15 @@ void mirror_sync(Pool& p) {
 namespace {
 std::unordered_map<uint32_t, uint64_t> rb_pages;   // (guest page -> mirror_epoch it was last read at)
 std::atomic<int64_t> st_rb_refresh{0}, st_rb_held{0};
+std::atomic<int64_t> st_rb_ever{0};   // (RX_VK_RB_EVER_PAGES: tier-two pages refreshed)
+// (hookshot, RX_VK_RB_EVER_PAGES) tier two of the readback history: pages whose 600-epoch TTL (memory_rb_refresh)
+// expired, kept per pool (Pool::rb_ever) and refreshed again while the GPU touches that pool's mirror again. The TTL
+// exists so a page the game stopped reading stops costing refresh copies; its hazard is a page the game goes on WRITING
+// without reading (a pause/menu stretch, then the exposure meter's untracked reset) — the write misses the refresh, the
+// mirror read and the write-back both carry the older words, and the readback's wait cannot see it. This tier keeps
+// those pages known; the refresh cost follows the pools the GPU actually binds (synced_epoch == mirror_epoch below), so
+// an idle menu's stale pages cost nothing
+constexpr size_t kRbEverMax = 4096;   // (pages a pool remembers: 16 MiB of 4 KiB pages; the oldest quarter goes first)
 // (the open submission the recording this thread is making joined; 0: none: it opens one, or comes after one's end)
 thread_local uint64_t rb_joined = 0;
 // (the GPU write hazards of submission rb_hazards_epoch, by guest address, with their recording's place in the queue
@@ -2448,6 +2474,16 @@ void memory_note_readback(uint64_t guest, uint64_t size) {
     if (off || !size || size > 0x4000) return;   // (small results only: meters and counters)
     std::lock_guard lk(pools_mu);
     for (uint64_t pg = guest >> kPageShift; pg <= (guest + size - 1) >> kPageShift; pg++) rb_pages[(uint32_t)pg] = mirror_epoch;
+}
+/// (hookshot, wb-minimize) whether any readback-history page (memory_note_readback) lies in guest [lo, hi):
+/// the early delivery is recorded only for ranges the game actually reads back (the meters and counters).
+/// Caller holds pools_mu (rb_pages's lock). A page expired from the map (600 epochs unread) reads as absent:
+/// no delivery, the value wait serves it
+bool rb_pages_touches(uint64_t guest_lo, uint64_t guest_hi) {
+    if (rb_pages.empty()) return false;
+    for (uint64_t pg = guest_lo >> kPageShift; pg <= (guest_hi - 1) >> kPageShift; pg++)
+        if (rb_pages.count(uint32_t(pg))) return true;
+    return false;
 }
 void memory_note_gpu_write(uint64_t gpu, uint64_t size) {
     if (!size) return;
@@ -2490,8 +2526,25 @@ bool memory_rb_refresh(VkCommandBuffer up) {
         return false;
     };
     std::map<Pool*, std::vector<VkBufferCopy>> by_pool;
+    static const bool ever = env_on("RX_VK_RB_EVER_PAGES");   // (tier two: an expired page stays known, per pool)
     for (auto it = rb_pages.begin(); it != rb_pages.end();) {
-        if (it->second + 600 < mirror_epoch) { it = rb_pages.erase(it); continue; }   // (not read for a while)
+        if (it->second + 600 < mirror_epoch) {   // (not read for a while)
+            if (ever) {
+                const uint32_t pg = it->first;
+                auto pit = imported.upper_bound((uint64_t)pg << kPageShift);
+                if (pit != imported.begin()) {
+                    --pit;
+                    Pool& p = pit->second;
+                    if ((uint64_t)pg << kPageShift >= p.lo && (uint64_t)pg << kPageShift < p.hi &&
+                        std::find(p.rb_ever.begin(), p.rb_ever.end(), pg) == p.rb_ever.end()) {
+                        if (p.rb_ever.size() >= kRbEverMax) p.rb_ever.erase(p.rb_ever.begin(), p.rb_ever.begin() + kRbEverMax / 4);
+                        p.rb_ever.push_back(pg);
+                    }
+                }
+            }
+            it = rb_pages.erase(it);
+            continue;
+        }
         const uint64_t g = (uint64_t)it->first << kPageShift;
         ++it;
         auto pit = imported.upper_bound(g);
@@ -2506,6 +2559,26 @@ bool memory_rb_refresh(VkCommandBuffer up) {
         }
         by_pool[&p].push_back({a, a, b - a});
     }
+    // (RX_VK_RB_EVER_PAGES, tier two) the expired pages of pools the GPU touches THIS submission refresh again: the
+    // hazard the TTL opens — a long-unread page's untracked CPU write (the exposure meter's reset) missing the
+    // refresh, so the mirror read and the write-back both carry the older words — is only live where the GPU reads the
+    // pool again, and `synced_epoch == mirror_epoch` is exactly "bound this submission" (gpu_buffer_bind's mirror_sync).
+    // A menu the GPU idles on costs nothing. A page the game read again (rb_pages above) is skipped here
+    if (ever)
+        for (auto& pe : imported) {
+            Pool& p = pe.second;
+            if (p.rb_ever.empty() || p.mstate != Pool::MIRROR_ON || !p.mirror) continue;
+            if (p.synced_epoch != mirror_epoch) continue;
+            for (uint32_t pg : p.rb_ever) {
+                if (rb_pages.count(pg)) continue;   // (the active loop above refreshed it)
+                const uint64_t g = (uint64_t)pg << kPageShift;
+                if (g < p.lo || g >= p.hi) continue;
+                const uint64_t a = g - p.lo, b = std::min(g + 4096, p.hi) - p.lo;
+                if (joined && (!ahead_made || written_ahead(p.lo + a, p.lo + b))) { st_rb_held++; continue; }
+                by_pool[&p].push_back({a, a, b - a});
+                st_rb_ever++;
+            }
+        }
     if (by_pool.empty()) return false;
     full_barrier(up);   // (after the older submissions' write-backs into guest memory and this one's other uploads)
     GprofSpan gp(up, "rbrefresh copies (readback pages guest -> mirror)");
@@ -2525,8 +2598,8 @@ bool memory_rb_refresh(VkCommandBuffer up) {
     }
     static std::atomic<int64_t> n{0};
     if (++n % 3000 == 1)
-        logf("vk: readback pages refreshed from guest memory: %lld pages so far (%lld held: may be written ahead in their submission)",
-             (long long)st_rb_refresh.load(), (long long)st_rb_held.load());
+        logf("vk: readback pages refreshed from guest memory: %lld pages so far (%lld held: may be written ahead in their submission; %lld tier-two ever-pages, RX_VK_RB_EVER_PAGES)",
+             (long long)st_rb_refresh.load(), (long long)st_rb_held.load(), (long long)st_rb_ever.load());
     return true;
 }
 
@@ -2669,6 +2742,8 @@ void note_direct_write(Pool& p, uint64_t off, uint64_t size) {   // (pools_mu he
         wb_pages_note(p.lo + off, p.lo + std::min(off + size, p.hi - p.lo), mem_rec_value);
 }
 
+void rb_deliver_note(Pool* p, uint64_t lo, uint64_t hi, uint64_t value);   // (wb-minimize, below: the early delivery)
+
 BufferRef gpu_buffer_bind(uint64_t gpu, uint64_t size, bool written) {
     if (written) texture_gpu_wrote(gpu, size);
     // (below 1 TB a GPU address is the guest address itself, and a pool holds the whole range or nothing: the host's
@@ -2776,6 +2851,7 @@ BufferRef gpu_buffer_bind(uint64_t gpu, uint64_t size, bool written) {
         }();
         if (!wb_max || size <= wb_max)
             writebacks.push_back({p, off, std::min(off + size, p->hi - p->lo)});
+        rb_deliver_note(p, off, std::min(off + size, p->hi - p->lo), mem_rec_value);   // (wb-minimize: delivered after the pass)
         rb_hazard_locked(p->lo + off, p->lo + std::min(off + size, p->hi - p->lo));   // (memory_rb_refresh)
     }
     return remember({p->mirror, off, size, 0});
@@ -3203,6 +3279,7 @@ struct DeadShadow {
 std::deque<DeadShadow> dead_shadows;
 uint64_t shadow_bytes = 0;
 int64_t st_wbd_runs = 0, st_wbd_bytes = 0, st_wbd_fill_pages = 0;
+int64_t st_wb_rb_runs = 0, st_wb_rb_bytes = 0;   // (RX_WB_RB_DIRECT: readback pages copied straight, not through the diff)
 bool wb_diff_on() {
     // (hookshot) On by default again (v2.0.11). v2.0.9 turned it off with the presents' own queue after the device lost on an RTX 4090
     // with NVIDIA's 621 driver (issue 1161); the reporter's A/B then put that on the present queue (black screen with it alone), and the
@@ -3546,6 +3623,9 @@ VkDeviceAddress wbd_observe_begin(WbdTable& t, uint64_t count) {
     return t.address + offset;
 }
 
+void memory_rb_drop_delivered_writebacks();   // (wb-minimize, defined below: drops the write-backs of the early deliveries)
+void memory_rb_deliver_pending_clear();   // (wb-minimize, defined below)
+
 void memory_end_submission(VkCommandBuffer cmd) {
     std::lock_guard lk(pools_mu);
     {   // (every 600 submissions: how the mirror syncs' dirty pages were read)
@@ -3565,6 +3645,10 @@ void memory_end_submission(VkCommandBuffer cmd) {
                      (long long)st_wbd_known_game, (long long)st_wbd_known_collected, (long long)st_wbd_known_replay);
             st_wbd_runs = st_wbd_bytes = st_wbd_fill_pages = 0;
             st_wbd_known_game = st_wbd_known_collected = st_wbd_known_replay = 0;
+            if (st_wb_rb_runs)   // (only RX_WB_RB_DIRECT=1 ever makes any: the default log is unchanged)
+                logf("vk: rb-direct (600 submits): %lld runs, %.1f MB of readback pages copied straight from the mirror "
+                     "(RX_WB_RB_DIRECT)", (long long)st_wb_rb_runs, st_wb_rb_bytes / 1048576.0);
+            st_wb_rb_runs = st_wb_rb_bytes = 0;
             if (wbd_observe_on()) {
                 logf("vk: write-back observations (completed since last report): %llu batches, %llu chunks, %llu changed; "
                      "%.1f MB compared, %.1f MB covered by changed chunks; %llu unavailable chunks; last completed value %llu",
@@ -3620,6 +3704,12 @@ void memory_end_submission(VkCommandBuffer cmd) {
     }
     static const bool no_writeback = env_on("RX_VK_NO_WRITEBACK");   // (an experiment: none)
     if (no_writeback) writebacks.clear();
+    memory_rb_drop_delivered_writebacks();   // (wb-minimize/RX_WB_RB_EVENTS: a range an early delivery recorded is not
+        //  written back again here — the game may have rewritten guest memory since (the meter's reset after its read,
+        //  released by the delivery's event), and the mirror's older words must not stomp it)
+    // (RX_WB_RB_DIRECT=1: the pages the CPU reads back copy straight from the mirror, out of the shadow's diff pass;
+    //  0/unset: every written binding through the diff, byte-identical to before)
+    static const bool rb_direct = env_on("RX_WB_RB_DIRECT");
     if (!writebacks.empty()) {
         // per pool, the ranges merged, one copy each (mirror -> the guest's pool)
         std::sort(writebacks.begin(), writebacks.end(), [](const WriteBack& a, const WriteBack& b) {
@@ -3636,11 +3726,13 @@ void memory_end_submission(VkCommandBuffer cmd) {
         struct ChunkSrc { Pool* p; uint64_t at, len; };
         static thread_local std::vector<ChunkSrc> chunk_src;   // (for the whole copy, when no table is free)
         static thread_local std::vector<VkBufferCopy> fills, odd;
+        static thread_local std::vector<VkBufferCopy> rb_directs;   // (RX_WB_RB_DIRECT: readback pages, straight copy)
+        static thread_local std::vector<VkBufferCopy> rb_kept;      // (their runs' remainders, left to the diff)
         chunks.clear(), chunk_src.clear();
         bool filled = false;
         for (size_t i = 0; i < writebacks.size();) {
             Pool* p = writebacks[i].pool;
-            runs.clear();
+            runs.clear(), rb_directs.clear();
             for (; i < writebacks.size() && writebacks[i].pool == p; i++) {
                 const WriteBack& w = writebacks[i];
                 if (!runs.empty() && w.lo <= runs.back().srcOffset + runs.back().size)
@@ -3653,8 +3745,57 @@ void memory_end_submission(VkCommandBuffer cmd) {
             checkpoint_mark(cmd, p->lo, 'b');
             uint64_t run_bytes = 0;
             for (const VkBufferCopy& r : runs) run_bytes += r.size;
-            if (diff && !p->shadow && run_bytes >= (256u << 10)) shadow_make(*p);   // (a pool whose write-back is worth one, as VRAM allows)
+            if (diff && !p->shadow && run_bytes >= (256u << 10)) {
+                // (RX_WB_RB_DIRECT) the readback share of the runs never reaches the diff (it copies straight, below,
+                //  where the shadow is known), so a pool whose non-readback runs are small does not become a shadow
+                //  candidate — no shadow churn introduced for the readback pools
+                uint64_t diff_bytes = run_bytes;
+                if (rb_direct && !rb_pages.empty())
+                    for (const VkBufferCopy& r : runs)
+                        for (uint64_t pg = (p->lo + r.dstOffset) >> kPageShift; pg <= (p->lo + r.dstOffset + r.size - 1) >> kPageShift; pg++) {
+                            const auto rb = rb_pages.find((uint32_t)pg);
+                            if (rb == rb_pages.end() || rb->second + 600 < mirror_epoch) continue;   // (as its expiry)
+                            const uint64_t a = r.dstOffset, z = r.dstOffset + r.size;
+                            const uint64_t lo = std::max<uint64_t>(a, (pg << kPageShift) - p->lo),
+                                           hi = std::min<uint64_t>(z, ((pg + 1) << kPageShift) - p->lo);
+                            if (lo < hi) diff_bytes -= hi - lo;
+                        }
+                if (diff_bytes >= (256u << 10)) shadow_make(*p);   // (a pool whose write-back is worth one, as VRAM allows)
+            }
             if (diff && p->shadow && p->address && p->mirror) {
+                // (RX_WB_RB_DIRECT=1, Variant B2) the pages the CPU reads back copy straight from the mirror — the copy
+                // the shadowless path below already makes — and their shadow is forgotten, as an odd run's is. A
+                // partition of the runs, never a dropped byte: rb_pages only routes a byte, and an entry missing or past
+                // its 600-epoch TTL (memory_rb_refresh) leaves it with the diff exactly as before.
+                if (rb_direct && !rb_pages.empty()) {
+                    rb_kept.clear();
+                    for (const VkBufferCopy& r : runs) {
+                        const uint64_t a = r.dstOffset, z = r.dstOffset + r.size;
+                        uint64_t seg = a;
+                        for (uint64_t pg = (p->lo + a) >> kPageShift; pg <= (p->lo + z - 1) >> kPageShift; pg++) {
+                            const auto rb = rb_pages.find((uint32_t)pg);
+                            if (rb == rb_pages.end() || rb->second + 600 < mirror_epoch) continue;   // (as its expiry)
+                            const uint64_t lo = std::max<uint64_t>(a, (pg << kPageShift) - p->lo),
+                                           hi = std::min<uint64_t>(z, ((pg + 1) << kPageShift) - p->lo);
+                            if (lo >= hi) continue;
+                            if (lo > seg) rb_kept.push_back({seg, seg, lo - seg});
+                            rb_directs.push_back({lo, lo, hi - lo});
+                            seg = hi;
+                        }
+                        if (seg < z) rb_kept.push_back({seg, seg, z - seg});
+                    }
+                    if (!rb_directs.empty()) {
+                        runs.swap(rb_kept);
+                        run_bytes = 0;
+                        for (const VkBufferCopy& r : runs) run_bytes += r.size;
+                        vkCmdCopyBuffer(cmd, p->mirror, p->buffer, (uint32_t)rb_directs.size(), rb_directs.data());
+                        for (const VkBufferCopy& r : rb_directs) {
+                            shadow_forget(*p, r.dstOffset, r.size);
+                            st_wb_rb_runs++;
+                            st_wb_rb_bytes += (int64_t)r.size;
+                        }
+                    }
+                }
                 VkBufferDeviceAddressInfo mda{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
                 mda.buffer = p->mirror;
                 const VkDeviceAddress mirror_address = vkGetBufferDeviceAddress(dev.device, &mda);
@@ -3698,8 +3839,10 @@ void memory_end_submission(VkCommandBuffer cmd) {
                 vkCmdCopyBuffer(cmd, p->mirror, p->buffer, (uint32_t)runs.size(), runs.data());
             }
             for (const VkBufferCopy& r : runs) st_wb_bytes += (int64_t)r.size, gp.bytes += r.size;
-            gp.items += (int)runs.size();
+            for (const VkBufferCopy& r : rb_directs) st_wb_bytes += (int64_t)r.size, gp.bytes += r.size;
+            gp.items += (int)(runs.size() + rb_directs.size());
             for (const VkBufferCopy& r : runs) wb_pages_note(p->lo + r.dstOffset, p->lo + r.dstOffset + r.size, mem_rec_value);   // (EvilBoyce)
+            for (const VkBufferCopy& r : rb_directs) wb_pages_note(p->lo + r.dstOffset, p->lo + r.dstOffset + r.size, mem_rec_value);
             {   // (hookshot) RX_VK_LOG_WRITEBACK=1: the pools written back the most, every 600 write-back submissions
                 static const bool log_wb = env_on("RX_VK_LOG_WRITEBACK");
                 if (log_wb) {
@@ -3707,7 +3850,8 @@ void memory_end_submission(VkCommandBuffer cmd) {
                     static int64_t subs;
                     auto& e = by_pool[p->lo];
                     for (const VkBufferCopy& r : runs) e.first += r.size;
-                    e.second += runs.size();
+                    for (const VkBufferCopy& r : rb_directs) e.first += r.size;
+                    e.second += runs.size() + rb_directs.size();
                     if (i == writebacks.size() && ++subs % 600 == 0) {
                         std::vector<std::pair<uint64_t, std::pair<uint64_t, uint64_t>>> v(by_pool.begin(), by_pool.end());
                         std::sort(v.begin(), v.end(), [](const auto& a, const auto& b) { return a.second.first > b.second.first; });
@@ -3767,12 +3911,202 @@ void memory_end_submission(VkCommandBuffer cmd) {
         transfer_barrier(cmd);
         writebacks.clear();
     }
+    // (RX_WB_RB_DIRECT / RX_WB_RB_EVENTS) the straight copies — and the early deliveries' copies, recorded on this
+    // command buffer after their producing passes — write guest memory via the TRANSFER stage: made available to the
+    // host's reads here, because ALL_COMMANDS does not include the host and a readback may observe the submission's
+    // completion by polling (vkGetSemaphoreCounterValue) rather than vkWaitSemaphores. The stock path's readbacks wait
+    // vkWaitSemaphores, which carries the host-visibility guarantee itself: with both switches off, byte-identical
+    if (rb_direct || memory_rb_events_on()) {
+        VkMemoryBarrier2 hb{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+        hb.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+        hb.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT;
+        hb.dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT;
+        hb.dstAccessMask = VK_ACCESS_2_HOST_READ_BIT;
+        VkDependencyInfo hd{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+        hd.memoryBarrierCount = 1;
+        hd.pMemoryBarriers = &hb;
+        vkCmdPipelineBarrier2(cmd, &hd);
+    }
     // (what this submission synced is current as of now: the GPU's own writes, stamped while it was recorded, are
     // in the mirror and written back; CPU writes collected at the next submission get a newer generation)
     for (Pool* p : mirror_synced) p->synced_gen = gen_now;
     mirror_synced.clear();
     mirror_upload = false;
+    memory_rb_deliver_pending_clear();   // (wb-minimize: binds not delivered by a pass of this submission deliver no more early)
 }
+/// (wb-minimize, called by memory_end_submission) ranges an early delivery recorded: drop their write-back entries.
+/// The delivery copied the same bytes already (its pages' values noted at the delivery); writing them back again here
+/// would stomp what the game rewrote in guest memory after its read (the meter's reset) with the mirror's older words
+bool memory_rb_events_on() {
+    static const bool on = env_on("RX_WB_RB_EVENTS");
+    static const bool told = on && (logf("vk: RX_WB_RB_EVENTS=1: readback ranges delivered after their producing pass, the readback polled by event"), true);
+    (void)told;
+    return on;
+}
+namespace {
+struct RbDeliver {
+    Pool* p;
+    uint64_t lo, hi;   // guest addresses of the bind's range (what the write-back would copy)
+    VkEvent ev;        // signaled once this delivery's copies are host-visible
+    uint64_t value;    // the submission whose write-back covers it (mem_rec_value at the bind)
+    bool done;         // (its copies were recorded: the end-of-submission write-back skips the range — the game's
+                       //  post-submit rewrite of it, the meter reset, must not be stomped by the mirror's older words)
+};
+std::mutex rb_delivers_mu;
+std::deque<RbDeliver> rb_delivers;              // recent deliveries, by age (the readback's lookup scans it)
+constexpr size_t kRbDeliverKeep = 4096;         // (a readback looks one up while its submission is in flight: far fewer;
+                                                //  the pending pointers clear at the submission's end, so no pointer
+                                                //  survives a wrap)
+struct RbEventSlot { VkEvent ev; uint64_t last_value; };
+std::vector<RbEventSlot> rb_event_slots;        // (events reused once the GPU is past the submission that set them)
+thread_local std::vector<RbDeliver*> rb_deliver_pending;   // (the recording thread's: binds awaiting their delivering pass)
+int64_t st_rb_deliveries = 0, st_rb_deliver_bytes = 0, st_rb_event_hits = 0, st_rb_event_misses = 0, st_rb_event_looks = 0;
+
+/// An event whose previous signal the GPU is past (mem_completed), host-reset for the new submission's delivery
+VkEvent rb_event_acquire(uint64_t value) {   // (rb_delivers_mu held)
+    for (auto& s : rb_event_slots)
+        if (s.last_value <= mem_completed) {
+            vkResetEvent(dev.device, s.ev);
+            s.last_value = value;
+            return s.ev;
+        }
+    if (rb_event_slots.size() >= 32) return VK_NULL_HANDLE;
+    VkEventCreateInfo ci{VK_STRUCTURE_TYPE_EVENT_CREATE_INFO};
+    VkEvent ev = VK_NULL_HANDLE;
+    if (vkCreateEvent(dev.device, &ci, nullptr, &ev) != VK_SUCCESS) return VK_NULL_HANDLE;
+    rb_event_slots.push_back({ev, value});
+    return ev;
+}
+} // namespace
+/// (wb-minimize, called by memory_end_submission) this recording thread's undelivered binds stop early-delivering
+void memory_rb_deliver_pending_clear() {
+    rb_deliver_pending.clear();
+}
+void memory_rb_drop_delivered_writebacks() {
+    if (!memory_rb_events_on()) return;
+    std::lock_guard lk(rb_delivers_mu);
+    static thread_local std::vector<const RbDeliver*> delivered;
+    delivered.clear();
+    for (const RbDeliver& d : rb_delivers)
+        if (d.done && d.value == mem_rec_value) delivered.push_back(&d);
+    if (delivered.empty()) return;
+    writebacks.erase(std::remove_if(writebacks.begin(), writebacks.end(), [](const WriteBack& w) {
+        for (const RbDeliver* d : delivered)   // (static thread_local: no capture needed)
+            if (d->p == w.pool && d->lo == w.pool->lo + w.lo && d->hi == w.pool->lo + w.hi) return true;
+        return false;
+    }), writebacks.end());
+}
+
+// ---- (hookshot, wb-minimize) RX_WB_RB_EVENTS=1: the readback ranges delivered mid-submission ----
+// The write-back (memory_end_submission) delivers what the GPU wrote into guest memory at the submission's END, so the
+// CPU's readback (invalidate, vk_replay.cpp) waits for the covering submission's whole execution — the 5-8 ms a waiting
+// readback measured in the async campaign. The readback ranges are tiny (memory_note_readback keeps only the meters and
+// counters the game reads every frame, 16 KiB at most): for written binds whose range touches that history, this
+// records the bind's own write-back copy right after the pass that binds it (memory_rb_deliver, outside any render
+// pass), each with an event signaled as soon as the copy's writes are host-visible. The readback polls the event first:
+// the wait ends when the producing pass's delivery ran, instead of at the submission's end. The copy is the write-back's
+// own copy, made earlier: the same bytes (mirror -> guest, cut_cpu_words applied, so the replay's CPU-written report
+// words are not stomped), ordered after the producing pass by the command stream — guest memory never holds older data
+// than the end-of-submission write-back would leave, and never newer than the GPU has executed. The end-of-submission
+// write-back still runs (it re-copies the same bytes for these ranges; the shadows' diff may see them changed and
+// re-copy — a few KiB). RX_WB_RB_EVENTS unset or 0: nothing of this runs, byte-identical behavior.
+/// (gpu_buffer_bind's written branch, pools_mu held) a written bind of a mirrored pool that touches the readback
+/// history: its range rides the ring, delivered after the next pass on the recording thread
+void rb_deliver_note(Pool* p, uint64_t lo, uint64_t hi, uint64_t value) {
+    if (!memory_rb_events_on()) return;
+    if (par_active.load(std::memory_order_relaxed)) return;   // (a parallel segment's passes record out of order)
+    if (hi - lo > (64u << 10)) return;   // (wb-minimize: the early delivery is for the small-result class, as the
+                                         //  readback history itself is; a bigger bind keeps its end-of-submission
+                                         //  write-back, and the read of it the covering value's wait)
+    if (!rb_pages_touches(p->lo + lo, p->lo + hi)) return;
+    std::lock_guard lk(rb_delivers_mu);
+    while (rb_delivers.size() >= kRbDeliverKeep) rb_delivers.pop_front();
+    const VkEvent ev = rb_event_acquire(value);
+    if (!ev) return;
+    rb_delivers.push_back({p, p->lo + lo, p->lo + hi, ev, value, false});
+    rb_deliver_pending.push_back(&rb_delivers.back());
+    st_rb_deliveries++;
+}
+/// (vk_draw.cpp, after a pass ends or a game dispatch) what this recording thread's binds awaited: their write-back
+/// copies, recorded here — after the pass's work, before the submission's rest. One call a pass; nothing when no bind
+void memory_rb_deliver(VkCommandBuffer cmd) {
+    if (!memory_rb_events_on() || rb_deliver_pending.empty()) return;
+    std::lock_guard plock(pools_mu);
+    std::lock_guard lk(rb_delivers_mu);
+    if (rb_deliver_pending.empty()) return;
+    std::vector<VkBufferCopy> runs;
+    bool barrier = false;
+    for (RbDeliver* d : rb_deliver_pending) {
+        if (!d->p->mirror || !d->p->buffer) { d->ev = VK_NULL_HANDLE; continue; }   // (its mirror went: the value wait serves it)
+        runs.clear();
+        runs.push_back({d->lo - d->p->lo, d->lo - d->p->lo, d->hi - d->lo});
+        cut_cpu_words(*d->p, runs);
+        if (runs.empty()) { d->ev = VK_NULL_HANDLE; continue; }   // (the replay owns every word of it on the CPU already)
+        if (!barrier) transfer_barrier(cmd), barrier = true;   // (the pass's writes -> the copy's reads of the mirror)
+        vkCmdCopyBuffer(cmd, d->p->mirror, d->p->buffer, (uint32_t)runs.size(), runs.data());
+        for (const VkBufferCopy& r : runs) st_rb_deliver_bytes += (int64_t)r.size;
+        wb_pages_note(d->lo, d->hi, d->value);   // (the value semantics of the write-back this replaces: the next
+                                                 //  readback's covering value is this submission's, not an older one's)
+        d->done = true;
+        // (the signal: the copy's writes host-visible, then the event set — what the readback's poll waits on)
+        VkMemoryBarrier2 mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+        mb.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+        mb.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        mb.dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT;
+        mb.dstAccessMask = VK_ACCESS_2_HOST_READ_BIT;
+        VkDependencyInfo dep{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+        dep.memoryBarrierCount = 1;
+        dep.pMemoryBarriers = &mb;
+        vkCmdSetEvent2(cmd, d->ev, &dep);
+        checkpoint_mark(cmd, d->p->lo, 'b');
+    }
+    rb_deliver_pending.clear();
+}
+/// (invalidate's wait, vk_replay.cpp) an event covering guest [guest, guest + size) whose value is the readback's own
+/// covering value: poll it (vkGetEventStatus, RX_WB_RB_EVENT_POLL_MS) instead of the submission-timeline wait. False
+/// (fall back to the wait as before) when no delivery covers the range, its value is not the covering one, or the event
+/// did not set within the bound
+/// (every 3000 lookups) the early deliveries and what their events did
+void memory_rb_event_log();
+bool memory_writeback_event(uint64_t guest, uint64_t size, uint64_t value, VkEvent* ev) {
+    if (!memory_rb_events_on() || !size) return false;
+    memory_rb_event_log();
+    VkEvent found = VK_NULL_HANDLE;
+    {
+        std::lock_guard lk(rb_delivers_mu);
+        for (const RbDeliver& d : rb_delivers)
+            if (d.value == value && d.ev && d.lo <= guest && guest + size <= d.hi) {
+                found = d.ev;
+                break;
+            }
+    }
+    if (!found) return false;
+    static const int64_t poll_ms = env_int("RX_WB_RB_EVENT_POLL_MS", 30);
+    const auto t0 = std::chrono::steady_clock::now();
+    for (;;) {
+        if (vkGetEventStatus(dev.device, found) == VK_EVENT_SET) {
+            st_rb_event_hits++;
+            return true;
+        }
+        const int64_t ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                               std::chrono::steady_clock::now() - t0).count();
+        if (ms >= poll_ms) {
+            st_rb_event_misses++;
+            return false;
+        }
+        std::this_thread::sleep_for(std::chrono::microseconds(100));
+    }
+}
+/// (every 3000 lookups) the early deliveries and what their events did
+void memory_rb_event_log() {
+    std::lock_guard lk(rb_delivers_mu);
+    if (++st_rb_event_looks % 3000) return;
+    logf("vk: readback events: %lld deliveries (%.2f MB) recorded, the event set at %lld of %lld lookups "
+         "(%lld fell back to the value wait)",
+         (long long)st_rb_deliveries, st_rb_deliver_bytes / 1048576.0, (long long)st_rb_event_hits,
+         (long long)(st_rb_event_hits + st_rb_event_misses), (long long)st_rb_event_misses);
+}
+
 
 void memory_stats(int64_t* mirrors, uint64_t* mirror_mb, int64_t* sync_bytes, int64_t* sync_copies, int64_t* wb_bytes) {
     *mirrors = st_mirrors, *mirror_mb = mirror_bytes >> 20, *sync_bytes = st_sync_bytes, *sync_copies = st_sync_copies;

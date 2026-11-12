@@ -66,7 +66,7 @@ extern std::atomic<bool> par_active;   // (vk_replay.cpp: a parallel replay's se
 // The calls the recorder carries. V: value arguments only (handles, numbers, enums), one generic packer; A: arrays or structs behind
 // pointers, a packer of their own below. vk_work.h has a macro for each (the test checks the two lists agree).
 #define RX_REC_CALLS(V, A)                                                                                                         \
-    A(vkCmdPipelineBarrier2) A(vkCmdBeginRendering) V(vkCmdEndRendering)                                                           \
+    A(vkCmdPipelineBarrier2) A(vkCmdSetEvent2) A(vkCmdBeginRendering) V(vkCmdEndRendering)                                                           \
     V(vkCmdDraw) V(vkCmdDrawIndexed) V(vkCmdDrawIndirect) V(vkCmdDrawIndexedIndirect) V(vkCmdDrawIndirectCount)                     \
     V(vkCmdDrawIndexedIndirectCount) V(vkCmdDrawMeshTasksEXT) V(vkCmdDrawMeshTasksIndirectEXT) V(vkCmdDrawMeshTasksIndirectCountEXT) \
     V(vkCmdDispatch) V(vkCmdDispatchIndirect)                                                                                      \
@@ -90,7 +90,7 @@ extern std::atomic<bool> par_active;   // (vk_replay.cpp: a parallel replay's se
 #define RX_REC_BOUNDARIES(K, M)                                                                                                    \
     K(vkBeginCommandBuffer) K(vkEndCommandBuffer) K(vkResetCommandPool) K(vkDestroyCommandPool)                                    \
     K(vkQueueSubmit2) K(vkQueueWaitIdle) K(vkQueueBindSparse) K(vkQueuePresentKHR) K(vkAcquireNextImageKHR) K(vkDeviceWaitIdle)    \
-    K(vkWaitForFences) K(vkResetFences) K(vkWaitSemaphores) K(vkGetSemaphoreCounterValue)                                         \
+    K(vkWaitForFences) K(vkResetFences) K(vkWaitSemaphores) K(vkGetSemaphoreCounterValue) K(vkResetEvent)                                         \
     K(vkGetQueryPoolResults) K(vkResetQueryPool) K(vkGetQueueCheckpointDataNV) K(vkGetDeviceFaultInfoEXT) K(vkResetDescriptorPool)  \
     K(vkDestroyBuffer) K(vkDestroyImage) K(vkDestroyImageView) K(vkDestroyBufferView) K(vkDestroySampler) K(vkDestroyPipeline)      \
     K(vkDestroyPipelineLayout) K(vkDestroyDescriptorSetLayout) K(vkDestroyDescriptorPool) K(vkDestroyQueryPool)                   \
@@ -889,6 +889,20 @@ RX_REC_PACKER void pk_vkCmdPipelineBarrier2(VkCommandBuffer cb, const VkDependen
     e.emit(OP_vkCmdPipelineBarrier2, [=] { ::vkx::vkCmdPipelineBarrier2(cb, &c); }, [&] { ::vkx::vkCmdPipelineBarrier2(cb, di); });
 }
 inline constexpr auto& rx_vkCmdPipelineBarrier2 = Route<::vkx::vkCmdPipelineBarrier2, pk_vkCmdPipelineBarrier2>::call;
+
+RX_REC_PACKER void pk_vkCmdSetEvent2(VkCommandBuffer cb, VkEvent ev, const VkDependencyInfo* di) {
+    if (di->pNext || chained(di->pMemoryBarriers, di->memoryBarrierCount) ||
+        chained(di->pBufferMemoryBarriers, di->bufferMemoryBarrierCount) ||
+        chained(di->pImageMemoryBarriers, di->imageMemoryBarrierCount))
+        return fallback([&] { ::vkx::vkCmdSetEvent2(cb, ev, di); });
+    Enc e;
+    VkDependencyInfo c = *di;
+    c.pMemoryBarriers = e.dup(di->pMemoryBarriers, di->memoryBarrierCount);
+    c.pBufferMemoryBarriers = e.dup(di->pBufferMemoryBarriers, di->bufferMemoryBarrierCount);
+    c.pImageMemoryBarriers = e.dup(di->pImageMemoryBarriers, di->imageMemoryBarrierCount);
+    e.emit(OP_vkCmdSetEvent2, [=] { ::vkx::vkCmdSetEvent2(cb, ev, &c); }, [&] { ::vkx::vkCmdSetEvent2(cb, ev, di); });
+}
+inline constexpr auto& rx_vkCmdSetEvent2 = Route<::vkx::vkCmdSetEvent2, pk_vkCmdSetEvent2>::call;
 
 RX_REC_PACKER void pk_vkCmdBeginRendering(VkCommandBuffer cb, const VkRenderingInfo* ri) {
     if (ri->pNext || chained(ri->pColorAttachments, ri->colorAttachmentCount) || (ri->pDepthAttachment && ri->pDepthAttachment->pNext) ||

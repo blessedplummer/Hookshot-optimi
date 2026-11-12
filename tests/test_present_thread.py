@@ -100,9 +100,10 @@ def main():
     need(make[make.index("{") + 1:].lstrip().startswith("present_thread_drain();"),
          "create_swapchain does not wait for the presenter first")
     on = block(replay, "bool present_thread_on() {")
-    need('getenv("RX_VK_PRESENT_THREAD")' in on and "return e && atoi(e) != 0;" in on, "the switch is not RX_VK_PRESENT_THREAD, off by default")
-    need("const bool presenter_wanted = pt_env && atoi(pt_env) != 0;" in block(main_cpp, "bool create_device() {"),
-         "the presenter's queue is made while the presenter thread is off")
+    need('getenv("RX_VK_PRESENT_THREAD")' in on and 'return (e && atoi(e) != 0) || env_on("RX_ASYNC_RENDER");' in on,
+         "the switch is not RX_VK_PRESENT_THREAD (plus RX_ASYNC_RENDER, the async render's policy), off by default")
+    need("const bool presenter_wanted = (pt_env && atoi(pt_env) != 0) || env_on(\"RX_ASYNC_RENDER\");" in block(main_cpp, "bool create_device() {"),
+         "the presenter's queue is made while both switches are off")
     need("dev.presenter_queue && dev.presenter_supported" in on, "the presenter thread runs without a queue of its own that presents")
     dev_make = block(main_cpp, "bool create_device() {")
     swap = block(main_cpp, "bool create_swapchain(uint32_t width, uint32_t height) {")
