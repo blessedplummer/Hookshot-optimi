@@ -1769,6 +1769,8 @@ bool memory_capture_now(uint64_t value, uint64_t completed) {
     return c && take_capture(std::move(c), value, completed);
 }
 
+void publish_cap_ranges();   // (below, mkwvk scope: RX_VK_CAP_EAGER republishes at a new import)
+
 namespace {
 
 /// The imported pool holding [guest, guest + size) (imported now if it was not yet); null outside the pools.
@@ -1838,6 +1840,7 @@ void bg_drain() {
         if (bg_ready.empty()) return;
         ready.swap(bg_ready);
     }
+    bool new_pools = false;   // (a pool entering the table: its capture ranges publish once, after the batch)
     for (auto& [lo, p] : ready) {
         auto imp = imported.find(lo);
         if (imp != imported.end() && imp->second.hi >= p.hi) {
@@ -1867,7 +1870,9 @@ void bg_drain() {
         if (imp != imported.end()) retire_pool(imp);
         imported.emplace(lo, p);
         guest_pages_set(p.lo, p.hi, p.address);
+        new_pools = true;
     }
+    if (new_pools) publish_cap_ranges();   // (RX_VK_CAP_EAGER: a new pool's pages are captured from its first submission)
 }
 
 /// (amd-fix) An import on the replay thread stalled it 20-75 ms on an RX 9060 XT (the driver locks the chunk's pages, the
@@ -2060,6 +2065,7 @@ Pool* pool_lookup(uint64_t guest, uint64_t size) {
         }
         imp = imported.emplace(p.lo, p).first;
         guest_pages_set(p.lo, p.hi, p.address);
+        publish_cap_ranges();   // (RX_VK_CAP_EAGER: the pool's pages are captured from its first submission)
         if (chunk) prefetch_chunks(p.lo, p.hi, chunk);
         if (overlapped.size() > 1) {
             static int logged_merge;
@@ -2644,9 +2650,19 @@ int memory_guest_imported(uint64_t lo, uint64_t hi) {
 bool mirror_make(Pool& pool);   // (below)
 /// The mirrored pools, for the submit-time capture (memory_capture_submit) (pools_mu held)
 void publish_cap_ranges() {
+    // (hookshot, RX_VK_CAP_EAGER=1) the mirror-wanted and not-yet-bound pools publish too. A pool's first
+    // submission writes its pages while it is still mirror-less — the capture that ran at that submission's
+    // start did not know it (it was not imported yet) — and when its mirror is made, mirror_sync live-reads
+    // those writes from guest memory, racing the game's threads: the tearing the captures exist to prevent.
+    // Measured (off1, this campaign): the scene-load windows live-read 1.5-4.1k pages while every
+    // steady-state window reads 0 — the escape is real and it bites exactly at loads. MIRROR_REFUSED stays
+    // out: the GPU binds its guest memory, coherent by construction, so there is nothing to protect
+    static const bool eager = env_on("RX_VK_CAP_EAGER");
     std::vector<std::pair<uint64_t, uint64_t>> v;
     for (const auto& [lo, pool] : imported)
-        if (pool.mstate == Pool::MIRROR_ON || pool.was_mirrored) v.push_back({pool.lo, pool.hi});
+        if (pool.mstate == Pool::MIRROR_ON || pool.was_mirrored ||
+            (eager && pool.mstate != Pool::MIRROR_REFUSED))
+            v.push_back({pool.lo, pool.hi});
     std::lock_guard lk(cap_ranges_mu);
     cap_ranges.swap(v);
     cap_ranges_ver++;

@@ -50,6 +50,7 @@ std::deque<std::pair<uint64_t,uint64_t>> bg_queue;
 void bg_start() { bg_starts++; } // Recording spy: no thread or GPU import is started.
 void logf(const char*,...){} void bg_drain(){}
 void guest_pages_set(uint64_t,uint64_t,uint64_t){}
+void publish_cap_ranges() {}   // (RX_VK_CAP_EAGER: the capture's pool list republished at a new import — not under test here)
 void retire_pool(std::map<uint64_t,Pool>::iterator it) { imported.erase(it);last_pool=nullptr;std::fill(std::begin(pool_cache),std::end(pool_cache),nullptr);retires++; }
 enum { VK_SUCCESS = 0 };
 thread_local bool import_cooling = false;
