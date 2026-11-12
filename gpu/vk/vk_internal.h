@@ -128,6 +128,12 @@ struct BufferRef {
     VkBuffer buffer = VK_NULL_HANDLE;
     uint64_t offset = 0, size = 0;
     VkDeviceAddress address = 0;
+    bool live = false;   // (issue 1795) the binding is the pool's guest memory itself, and the recording it was made
+                         // in will be executed: the GPU reads it when it runs, and the game may rewrite it before
+                         // then - the pool has no mirror at the read. Set only by vk_memory.cpp's direct paths (the
+                         // mirror-less states: no mirrors at all, the budget's refusals, a make queued or deferred);
+                         // a mirror's binding is not (its copy was synced at the submit) and outside a recording,
+                         // neither
     explicit operator bool() const {
         return buffer != VK_NULL_HANDLE;
     }

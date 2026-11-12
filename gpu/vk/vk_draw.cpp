@@ -2786,10 +2786,17 @@ VkDescriptorBufferInfo uniform_range(const NvnState& s, const Stage& st, uint32_
                 FINE_N(FC_UBO_OVERLAY, 1);
                 return {cur->stream, at, n};
             }
-        // (RX_VK_UB_SNAPSHOT=1: the contents as they are now, in the stream, not the pool the GPU reads later)
+        // (RX_VK_UB_SNAPSHOT=1: the contents as they are now, in the stream, not the pool the GPU reads later. So is
+        // any binding of a pool without a mirror at the read (issue 1795's in-place hazard): the game rewrites its
+        // constants right after the submit, and a recording the GPU runs later reads the next frame's - a Steam Deck
+        // drew giant HUD hearts, slabs and stretched geometry from exactly this. The binding says whether it is the
+        // pool's guest memory (BufferRef::live): a mirror's binding was synced at the submit and binds in place, and
+        // a bind outside a recording executes nothing. The states that bind guest memory: no mirrors at all
+        // (integrated GPUs, RX_VK_MIRROR=0, GCN), the mirror budget's refusals, a make queued or deferred
+        // (RX_VK_MIRROR_DEFER))
         static const bool snapshot = env_on("RX_VK_UB_SNAPSHOT");
         BufferRef b = snapshot ? BufferRef{} : gpu_buffer_bind(u.addr, n, false);
-        if (b && b.offset % align == 0) return {b.buffer, b.offset, n};
+        if (b && b.offset % align == 0 && !b.live) return {b.buffer, b.offset, n};
         const uint64_t at = stream_alloc(n, align);   // (unaligned or outside the pools: copied into the stream)
         if (at == UINT64_MAX) return bi;
         FINE_N(FC_UBO_STREAM, 1);
